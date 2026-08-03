@@ -10,6 +10,7 @@
 #include "DiscoveryManager.h"
 #include "BusHistory.h"
 #include "OTAManager.h"
+#include "BLEScanner.h"
 
 // ---------------------------------------------------------------------------
 // Minimal ESP32 I2C implementation (wraps Arduino Wire library)
@@ -115,6 +116,9 @@ ESP32I2CInterface i2cBus;
 SensorManager*    sensorManager = nullptr;
 DiscoveryManager  discoveryManager;
 OTAManager        otaManager;
+#if BOARD_HAS_BLE
+mcp::BLEScanner   bleScanner;
+#endif
 
 // Task handles
 TaskHandle_t mcpTaskHandle = nullptr;
@@ -128,9 +132,41 @@ void mcpTask(void* parameter) {
     }
 }
 
+// Serialise a BLEServiceInfo vector into a JSON-RPC result envelope under
+// "result.services".  Shared by the ble/services/start and ble/services/results
+// handlers.
+static std::string buildServicesResponse(uint32_t id,
+                                         const std::vector<mcp::BLEServiceInfo>& services,
+                                         bool connected) {
+    JsonDocument doc;
+    doc["jsonrpc"] = "2.0";
+    doc["id"] = id;
+    doc["result"]["connected"] = connected;
+    JsonArray svcArr = doc["result"]["services"].to<JsonArray>();
+    for (const auto& svc : services) {
+        JsonObject so = svcArr.add<JsonObject>();
+        so["uuid"] = svc.uuid;
+        JsonArray chrArr = so["characteristics"].to<JsonArray>();
+        for (const auto& chr : svc.characteristics) {
+            JsonObject co = chrArr.add<JsonObject>();
+            co["uuid"]       = chr.uuid;
+            co["properties"] = chr.properties;
+            if (!chr.valueHex.empty())  co["valueHex"] = chr.valueHex;
+            if (!chr.valueText.empty()) co["valueText"] = chr.valueText;
+        }
+    }
+    std::string out; serializeJson(doc, out); return out;
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Starting up...");
+
+    // Initialise the BLE stack FIRST, while the heap is still unfragmented.
+    // Bluetooth needs large contiguous allocations (bt_workqueue, controller
+    // RAM); doing this after the bus-history ring buffers allocate fails with
+    // "BTU_StartUp Unable to allocate resources for bt_workqueue".
+    bleScanner.begin();
 
     // Initialize LittleFS
     if (!LittleFS.begin(true)) {
@@ -382,6 +418,122 @@ void setup() {
             doc["result"]["ok"] = true;
             std::string out; serializeJson(doc, out); return out;
         });
+
+    // --- BLE scanning / GATT enumeration ---
+    // (BLE stack initialised at the top of setup() so it allocates before the
+    // bus-history ring buffers fragment the heap.)
+#if BOARD_HAS_BLE
+
+    // ble/scan — one-shot scan for `durationMs` (default 5000).
+    mcpServer.registerMethodHandler("ble/scan",
+        [](uint8_t, uint32_t id, const JsonObject& p) -> std::string {
+            uint32_t durationMs = p["durationMs"] | 5000u;
+            bool started = bleScanner.startScan(durationMs);
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["started"] = started;
+            doc["result"]["scanning"] = bleScanner.isScanning();
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/scan/results — stop scan (if running) and return captured reports.
+    mcpServer.registerMethodHandler("ble/scan/results",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            bleScanner.stopScan();
+            auto reports = bleScanner.getResults();
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            JsonArray arr = doc["result"]["devices"].to<JsonArray>();
+            for (const auto& r : reports) {
+                JsonObject o = arr.add<JsonObject>();
+                o["mac"]          = r.mac;
+                o["name"]         = r.name;
+                o["rssi"]         = r.rssi;
+                o["services"]     = r.servicesHex;
+                o["manufacturer"] = r.manufacturer;
+                o["connectable"]  = r.isConnectable;
+                o["count"]        = r.count;
+                if (r.firstSeen != 0) o["firstSeen"] = r.firstSeen;
+                // Distinct payloads seen for this MAC, oldest -> newest.
+                JsonArray hist = o["payloadHistory"].to<JsonArray>();
+                for (const auto& p : r.payloadHistory) {
+                    hist.add(p);
+                }
+            }
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/scan/stop — stop a continuous scan early.
+    mcpServer.registerMethodHandler("ble/scan/stop",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            bleScanner.stopScan();
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["ok"] = true;
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/connect — GATT client connect to a peer MAC.
+    mcpServer.registerMethodHandler("ble/connect",
+        [](uint8_t, uint32_t id, const JsonObject& p) -> std::string {
+            std::string mac;
+            if (p["mac"].is<const char*>()) mac = p["mac"].as<const char*>();
+            uint32_t timeoutMs = p["timeoutMs"] | 5000u;
+            bool ok = false;
+            if (!mac.empty()) ok = bleScanner.connect(mac, timeoutMs);
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["ok"] = ok;
+            doc["result"]["connected"] = bleScanner.isConnected();
+            if (!ok && mac.empty())
+                doc["error"]["message"] = "mac required";
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/disconnect — drop the GATT link.
+    mcpServer.registerMethodHandler("ble/disconnect",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            bleScanner.disconnect();
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["ok"] = true;
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/services/start — enumerate services/characteristics of the connected
+    // device, read readable values, subscribe to notifiable characteristics.
+    // Returns immediately; notified values arrive via ble/services/results.
+    mcpServer.registerMethodHandler("ble/services/start",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            auto services = bleScanner.getServicesStart();
+            return buildServicesResponse(id, services, bleScanner.isConnected());
+        });
+
+    // ble/services/results — wait up to notifyCaptureMs for notified values,
+    // then return the (possibly updated) enumeration.
+    mcpServer.registerMethodHandler("ble/services/results",
+        [](uint8_t, uint32_t id, const JsonObject& p) -> std::string {
+            uint32_t captureMs = p["notifyCaptureMs"] | 3000u;
+            auto services = bleScanner.getServicesResults(captureMs);
+            return buildServicesResponse(id, services, bleScanner.isConnected());
+        });
+
+    // ble/services/stop — unsubscribe from all notifiable characteristics.
+    mcpServer.registerMethodHandler("ble/services/stop",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            bleScanner.getServicesStop();
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["ok"] = true;
+            std::string out; serializeJson(doc, out); return out;
+        });
+#endif // BOARD_HAS_BLE
 
     // Create MCP task
     xTaskCreatePinnedToCore(

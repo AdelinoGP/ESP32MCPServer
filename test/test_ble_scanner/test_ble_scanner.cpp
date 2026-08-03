@@ -1,0 +1,151 @@
+#include <unity.h>
+#include "BLEScannerCore.h"
+#include <string>
+#include <vector>
+
+using namespace mcp::blecore;
+
+void setUp(void) {}
+void tearDown(void) {}
+
+// ---------------------------------------------------------------------------
+// hexEncode / hexToAscii
+// ---------------------------------------------------------------------------
+
+void test_hex_encode_basic(void) {
+    const uint8_t data[] = {0x00, 0x01, 0xAB, 0xFF};
+    TEST_ASSERT_EQUAL_STRING("0001abff", hexEncode(data, 4).c_str());
+}
+
+void test_hex_encode_empty(void) {
+    TEST_ASSERT_EQUAL_STRING("", hexEncode(nullptr, 0).c_str());
+}
+
+void test_hex_encode_single_bytes(void) {
+    for (int v = 0; v < 256; ++v) {
+        uint8_t b = static_cast<uint8_t>(v);
+        std::string h = hexEncode(&b, 1);
+        TEST_ASSERT_EQUAL(2, h.length());
+    }
+}
+
+void test_hex_to_ascii_printable_roundtrip(void) {
+    // "ABC" -> 414243 -> "ABC"
+    TEST_ASSERT_EQUAL_STRING("ABC", hexToAscii("414243").c_str());
+}
+
+void test_hex_to_ascii_non_printables_become_dot(void) {
+    // 0x00 0x1F 0x7F -> all non-printable -> "..."
+    TEST_ASSERT_EQUAL_STRING("...", hexToAscii("001f7f").c_str());
+}
+
+void test_hex_decode_roundtrip(void) {
+    const uint8_t data[] = {0x6D, 0xB6, 0x43, 0xCE, 0x97, 0xFE, 0x42, 0x7C, 0xE5, 0x00, 0x00};
+    std::string enc = hexEncode(data, sizeof(data));
+    std::string dec;
+    TEST_ASSERT_TRUE(hexDecode(enc, dec));
+    TEST_ASSERT_EQUAL(sizeof(data), dec.length());
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(data, reinterpret_cast<const uint8_t*>(dec.data()), sizeof(data));
+}
+
+void test_hex_decode_odd_length_fails(void) {
+    std::string out = "keep";
+    TEST_ASSERT_FALSE(hexDecode("abc", out));
+    TEST_ASSERT_EQUAL_STRING("keep", out.c_str());  // unchanged on failure
+}
+
+void test_hex_decode_invalid_char_fails(void) {
+    std::string out;
+    TEST_ASSERT_FALSE(hexDecode("zz", out));  // 'z' is not hex
+}
+
+void test_hex_decode_empty_ok(void) {
+    std::string out = "keep";
+    TEST_ASSERT_TRUE(hexDecode("", out));
+    TEST_ASSERT_EQUAL(0, out.length());
+}
+
+// ---------------------------------------------------------------------------
+// payloadIsConnectable — flags AD type (0x01)
+// ---------------------------------------------------------------------------
+
+void test_connectable_flags_general_discoverable(void) {
+    // 02 01 02 : flags AD, General Discoverable (0x02), BR/EDR supported
+    const uint8_t payload[] = {0x02, 0x01, 0x02};
+    TEST_ASSERT_TRUE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_flags_br_edr_not_supported(void) {
+    // 02 01 04 : flags AD, BR/EDR Not Supported (0x04) -> non-connectable
+    const uint8_t payload[] = {0x02, 0x01, 0x04};
+    TEST_ASSERT_FALSE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_flags_both_bits(void) {
+    // 02 01 06 : General Discoverable + BR/EDR Not Supported
+    const uint8_t payload[] = {0x02, 0x01, 0x06};
+    TEST_ASSERT_FALSE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_flags_not_first_ad(void) {
+    // 02 01 06 : flags not first -> still found
+    const uint8_t payload[] = {0x02, 0x01, 0x06};
+    TEST_ASSERT_FALSE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_missing_flags_defaults_true(void) {
+    // no flags AD — only a name AD
+    const uint8_t payload[] = {0x05, 0x09, 'H', 'e', 'l', 'l', 'o'};
+    TEST_ASSERT_TRUE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_empty_payload_defaults_true(void) {
+    TEST_ASSERT_TRUE(payloadIsConnectable(nullptr, 0));
+}
+
+void test_connectable_truncated_ad_defaults_true(void) {
+    // AD claims length 5 but only 3 bytes remain -> malformed, stop parsing
+    const uint8_t payload[] = {0x05, 0x01, 0x02};
+    TEST_ASSERT_TRUE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_flags_after_service_ad(void) {
+    // 02 01 06 first, then a service UUID AD, then flags again
+    const uint8_t payload[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0x8F, 0xAE, 0x02, 0x01, 0x02};
+    // First flags AD (BR/EDR not supported) wins
+    TEST_ASSERT_FALSE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+void test_connectable_zero_length_ad_terminates(void) {
+    const uint8_t payload[] = {0x00, 0x01, 0x02};
+    TEST_ASSERT_TRUE(payloadIsConnectable(payload, sizeof(payload)));
+}
+
+// ---------------------------------------------------------------------------
+
+int runUnityTests(void) {
+    UNITY_BEGIN();
+    RUN_TEST(test_hex_encode_basic);
+    RUN_TEST(test_hex_encode_empty);
+    RUN_TEST(test_hex_encode_single_bytes);
+    RUN_TEST(test_hex_to_ascii_printable_roundtrip);
+    RUN_TEST(test_hex_to_ascii_non_printables_become_dot);
+    RUN_TEST(test_hex_decode_roundtrip);
+    RUN_TEST(test_hex_decode_odd_length_fails);
+    RUN_TEST(test_hex_decode_invalid_char_fails);
+    RUN_TEST(test_hex_decode_empty_ok);
+    RUN_TEST(test_connectable_flags_general_discoverable);
+    RUN_TEST(test_connectable_flags_br_edr_not_supported);
+    RUN_TEST(test_connectable_flags_both_bits);
+    RUN_TEST(test_connectable_flags_not_first_ad);
+    RUN_TEST(test_connectable_missing_flags_defaults_true);
+    RUN_TEST(test_connectable_empty_payload_defaults_true);
+    RUN_TEST(test_connectable_truncated_ad_defaults_true);
+    RUN_TEST(test_connectable_flags_after_service_ad);
+    RUN_TEST(test_connectable_zero_length_ad_terminates);
+    return UNITY_END();
+}
+
+int main(void) {
+    return runUnityTests();
+}
