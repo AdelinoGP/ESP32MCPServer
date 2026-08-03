@@ -8,7 +8,8 @@
 #define BOARD_NAME          "ESP32-C3-DevKitM-1"
 #define BOARD_VARIANT       "esp32c3"
 #define BOARD_HAS_WIFI      1
-#define BOARD_HAS_BLE       1   // BLE 5.0 (no Classic BT)
+// 4 MB flash: BLE + OTA + full server exceeds the 1.25 MB OTA app slot.
+#define BOARD_HAS_BLE       0
 #define BOARD_HAS_CAN       1   // TWAI
 
 // ── Memory ───────────────────────────────────────────────────────────────────

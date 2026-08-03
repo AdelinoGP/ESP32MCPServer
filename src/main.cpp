@@ -166,7 +166,9 @@ void setup() {
     // Bluetooth needs large contiguous allocations (bt_workqueue, controller
     // RAM); doing this after the bus-history ring buffers allocate fails with
     // "BTU_StartUp Unable to allocate resources for bt_workqueue".
+#if BOARD_HAS_BLE
     bleScanner.begin();
+#endif
 
     // Initialize LittleFS
     if (!LittleFS.begin(true)) {

@@ -12,7 +12,7 @@
 #include <BLEAdvertisedDevice.h>
 #include <BLEScan.h>
 #include <esp_gattc_api.h>
-#include <FreeRTOS.h>
+#include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #else

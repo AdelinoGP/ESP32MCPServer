@@ -37,10 +37,12 @@ Connect an AI agent directly to your hardware: query I2C sensors, parse NMEA 018
 | Board | PlatformIO env | MCU | Flash | RAM | WiFi | BLE | CAN | RGB LED |
 |---|---|---|---|---|---|---|---|---|
 | **ESP32-S3-DevKitC-1** | `esp32-s3-devkitc-1` | Xtensa LX7 × 2 @ 240 MHz | 8 MB | 512 KB + 8 MB PSRAM | ✓ | 5.0 | ✓ | GPIO48 |
-| **ESP32-DevKitC V4** | `esp32-devkitc` | Xtensa LX6 × 2 @ 240 MHz | 4 MB | 520 KB | ✓ | 4.2 | ✓ | — |
-| **ESP32-C3-DevKitM-1** | `esp32-c3-devkitm-1` | RISC-V @ 160 MHz | 4 MB | 400 KB | ✓ | 5.0 | ✓ | GPIO8 |
-| **Adafruit HUZZAH32** | `adafruit-huzzah32` | Xtensa LX6 × 2 @ 240 MHz | 4 MB | 520 KB | ✓ | 4.2 | ✓ | — |
-| **M5Stack Core ESP32** | `m5stack-core` | Xtensa LX6 × 2 @ 240 MHz | 16 MB | 520 KB | ✓ | 4.2 | ✗ | — |
+| **ESP32-DevKitC V4** | `esp32-devkitc` | Xtensa LX6 × 2 @ 240 MHz | 4 MB | 520 KB | ✓ | ✗¹ | ✓ | — |
+| **ESP32-C3-DevKitM-1** | `esp32-c3-devkitm-1` | RISC-V @ 160 MHz | 4 MB | 400 KB | ✓ | ✗¹ | ✓ | GPIO8 |
+| **Adafruit HUZZAH32** | `adafruit-huzzah32` | Xtensa LX6 × 2 @ 240 MHz | 4 MB | 520 KB | ✓ | ✗¹ | ✓ | — |
+| **M5Stack Core ESP32** | `m5stack-core` | Xtensa LX6 × 2 @ 240 MHz | 16 MB | 520 KB | ✓ | ✗¹ | ✗ | — |
+
+¹ 4 MB-flash boards: the BLE stack + the MCP WebSocket server + OTA cannot all fit the 1.25 MB OTA app slot, so BLE is compiled out (the hardware still supports it). BLE is available on the ESP32-S3 (8 MB flash).
 
 ### nRF52840 Boards — Sensor Only (I2C + Serial, no WiFi)
 
@@ -56,7 +58,7 @@ Connect an AI agent directly to your hardware: query I2C sensors, parse NMEA 018
 | Feature | ESP32-S3 | ESP32 V4 | ESP32-C3 | HUZZAH32 | M5Stack | nRF52840-DK | nRF52840-Feather |
 |---|---|---|---|---|---|---|---|
 | WiFi | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
-| BLE | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| BLE | ✓ | ✗¹ | ✗¹ | ✗¹ | ✗¹ | ✓ | ✓ |
 | CAN / TWAI | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ |
 | I2C | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | UART (ext) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
@@ -532,6 +534,8 @@ After subscribing the server pushes unsolicited `notifications/resources/updated
 ### Bluetooth (BLE)
 
 Active BLE advertising capture for reverse-engineering broadcast formats, plus optional GATT enumeration.  Scans are **non-blocking**: start a scan, wait, then fetch results.
+
+> BLE is currently built for the ESP32-S3 target only (8 MB flash).  On the 4 MB-flash boards the BLE stack cannot fit alongside the WebSocket server and OTA, so the `ble/*` methods are not compiled there.
 
 | Method | Params | Description |
 |---|---|---|
