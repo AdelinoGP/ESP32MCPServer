@@ -5,36 +5,26 @@
 #include <string>
 #include <vector>
 
+#include "BLEGattCore.h"
 #include "BLEScannerCore.h"
 
 #ifndef NATIVE_TEST
 #include <BLEAdvertisedDevice.h>
 #include <BLEScan.h>
+#include <esp_gattc_api.h>
 #include <FreeRTOS.h>
-#include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #else
 class BLEAdvertisedDevice;
 class BLEScanResults;
-class BLERemoteCharacteristic;
+struct esp_ble_gattc_cb_param_t;
+using esp_gatt_if_t = uint16_t;
+using esp_bd_addr_t = uint8_t[6];
+using esp_gattc_cb_event_t = int;
 #endif
 
 namespace mcp {
-
-// One GATT characteristic discovered on a connected device.
-struct BLECharInfo {
-    std::string uuid;
-    std::string properties;   // read/write/notify/indicate/...
-    std::string valueHex;     // last read / notified value (may be empty)
-    std::string valueText;    // printable ASCII of valueHex (may be empty)
-};
-
-// One GATT service discovered on a connected device.
-struct BLEServiceInfo {
-    std::string uuid;
-    std::vector<BLECharInfo> characteristics;
-};
 
 // ---------------------------------------------------------------------------
 // BLEScanner — BLE advertising capture + optional GATT enumeration.
@@ -42,8 +32,8 @@ struct BLEServiceInfo {
 // Purpose: capture what nearby devices broadcast so the payload format of a
 // given app/device can be reverse engineered.  All captured data is exposed
 // through MCP JSON-RPC methods (ble/scan, ble/scan/results, ble/scan/stop,
-// ble/connect, ble/disconnect, ble/services/start, ble/services/results,
-// ble/services/stop).
+// ble/connect, ble/connect/results, ble/disconnect, ble/services/start,
+// ble/services/results, ble/services/stop).
 //
 // Threading notes:
 //   * startScan() uses the NON-blocking BLEScan::start(duration, cb, false)
@@ -51,18 +41,28 @@ struct BLEServiceInfo {
 //   * The scan-completion callback runs on the Bluetooth controller task
 //     (BTC_TASK); it must NOT call esp_ble_gap_stop_scanning() or any other
 //     controller API (deadlock + WDT abort).  It only flips a flag.
-//   * getServices()/getServicesResults() block briefly (bounded by
-//     notifyCaptureMs) to collect notified values — use the two-phase
-//     start/results API to keep the MCP task responsive.
+//   * GATT operations are event-driven on the raw esp_gattc API, with
+//     per-operation deadlines enforced by a dedicated task: open (timeoutMs),
+//     discovery (10 s), reads (5 s).  A slow or uncooperative peer can never
+//     block the MCP task, and the connection is never freed underneath a
+//     running operation (the task only exits from the Idle state).
+//   * All state shared with the BLE stack tasks (scan results, GATT results,
+//     connection state) is guarded by a recursive mutex; the lock is never
+//     held across a blocking wait or a controller API call.
 // ---------------------------------------------------------------------------
 class BLEScanner {
 public:
-    BLEScanner() = default;
+    BLEScanner();
+    ~BLEScanner();
 
-    // Initialise the BLE stack.  Safe to call once at boot.
+    BLEScanner(const BLEScanner&) = delete;
+    BLEScanner& operator=(const BLEScanner&) = delete;
+
+    // Initialise the BLE stack and hook the GATT client callback.  Safe to
+    // call once at boot.
     void begin();
 
-    // ---- Passive scanning --------------------------------------------------
+    // ---- Advertising scanning ----------------------------------------------
 
     // Start an advertising scan for `durationMs` (0 = continuous until stop()).
     // Returns true if a scan was started.  Non-blocking.
@@ -83,33 +83,44 @@ public:
     // Reset the captured report list.
     void clearResults();
 
-    // ---- GATT client (two-phase) ------------------------------------------
+    // ---- GATT client (raw esp_gattc, two-phase) ----------------------------
 
-    // Connect to a peer by MAC ("AA:BB:CC:DD:EE:FF" or "aa:bb:cc:dd:ee:ff").
-    // Returns true on success; connection is asynchronous.
+    // Begin an asynchronous connection to a peer by MAC
+    // ("AA:BB:CC:DD:EE:FF" or "aa:bb:cc:dd:ee:ff").  Returns true if the
+    // attempt was started; the open handshake completes (or is aborted) in
+    // the background within `timeoutMs`.  Poll isConnected() /
+    // isConnecting() or ble/connect/results for the outcome.
     bool connect(const std::string& mac, uint32_t timeoutMs = 5000);
 
+    // True while an async connect attempt is still in flight.
+    bool isConnecting() const;
+
+    // True once the async connect has completed (link open).
+    bool getConnectResults() const;
+
+    // Drop the GATT link.  Safe to call while a discovery is in flight; the
+    // GATT task is told to close and exits from the Idle state.
     void disconnect();
 
     bool isConnected() const;
 
     // Phase 1: enumerate services + characteristics of the connected device,
     // read readable values, and subscribe to all notifiable/indicatable
-    // characteristics.  Returns immediately with the enumeration (notified
-    // values are captured asynchronously into the returned structures).
-    // NOTE: GATT discovery runs on a dedicated task; a slow/uncooperative
-    // peer cannot block the MCP task.  Wait for ready via ble/services/results.
+    // characteristics.  Returns immediately; enumeration runs event-driven
+    // with the GATT task enforcing deadlines.  Wait for ready via
+    // ble/services/results.
     std::vector<BLEServiceInfo> getServicesStart();
 
-    // Phase 2: wait up to `notifyCaptureMs` for the enumeration (started by
-    // getServicesStart) to complete AND for notified/indicated values to
-    // arrive, then return the enumeration.  Blocks briefly.
+    // Phase 2: wait (bounded: 10 s discovery cap, then `notifyCaptureMs` for
+    // notified/indicated values) for the enumeration, then return it with any
+    // captured notification values folded in.  Blocks briefly on the MCP task.
     std::vector<BLEServiceInfo> getServicesResults(uint32_t notifyCaptureMs = 3000);
 
-    // Phase 3: unsubscribe from all notifiable characteristics.
+    // Phase 3: unsubscribe from all notifiable characteristics and close the
+    // connection once enumeration work is done.
     void getServicesStop();
 
-    // True while the GATT discovery task is still enumerating.
+    // True while the GATT connection has pending enumeration work.
     bool isServicesBusy() const;
 
     // Advertising report callback (invoked by the BLE stack).
@@ -118,29 +129,68 @@ public:
     // Scan completion hook (BLE stack callback, non-blocking start()).
     static void onScanCompleteStatic(BLEScanResults results);
 
+    // Bluedroid GATT client event — invoked from the BLE library's registered
+    // handler (chained in begin()).  Must not call controller APIs; it only
+    // records state and signals the GATT task.
+    void onGattcEvent(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
+                      esp_ble_gattc_cb_param_t* param);
+
 private:
+    // ---- GATT task ---------------------------------------------------------
+
+    void gattTaskBody();
+    static void gattTaskStatic(void* param);
+    void ensureGattTask();
+    void gattLoadServices();
+    void gattStartReads();
+    void gattSubscribeAll();
+    void gattUnsubscribeAll();
+    // Called with the mutex held: mark enumeration complete and signal.
+    void gattEnumDone();
+    void gattFail();
+
+    // ---- state (guarded by mutex_) -----------------------------------------
+
+    mutable SemaphoreHandle_t mutex_ = nullptr;
+
     bool scanning_ = false;
     bool connected_ = false;
     std::string connectedMac_;
     std::vector<BLEAdvReport> reports_;
-    std::vector<BLEServiceInfo> services_;
     // MAC -> set of payloads already recorded for that device (dedupe).
     std::map<std::string, std::map<std::string, bool>> seenPayloads_;
-    // Registered notify callbacks (per characteristic UUID), released by
-    // getServicesStop().
-    std::map<std::string, class BLERemoteCharacteristic*> notifyChars_;
-    std::map<std::string, std::string> notifyValues_;
+    std::vector<BLEServiceInfo> services_;
+
 #ifndef NATIVE_TEST
-    class BLEClient* client_ = nullptr;
+    // Raw esp_gattc client state (only valid while the BLE stack is active).
+    esp_gatt_if_t gattcIf_ = 0;
+    uint16_t connId_ = 0;
+    esp_bd_addr_t peerAddr_ = {0};
+    bool hasPeer_ = false;
+    gattcore::GattState gattState_ = gattcore::GattState::Idle;
+    uint32_t stateStartMillis_ = 0;
+    uint32_t connectTimeoutMs_ = 5000;
+    bool registerIssued_ = false;
+    bool appRegistered_ = false;
+    bool openIssued_ = false;
+    bool searchIssued_ = false;
+    bool closeIssued_ = false;
+    bool loadPending_ = false;
+    // Characteristic reads issued and awaiting READ_CHAR_EVT.
+    std::map<uint16_t, std::string> pendingReads_;  // handle -> uuid
     TaskHandle_t gattTaskHandle_ = nullptr;
     SemaphoreHandle_t gattDoneSem_ = nullptr;
-    volatile bool gattBusy_ = false;
-    volatile bool gattCancelled_ = false;
-    void onNotify(class BLERemoteCharacteristic* chr, uint8_t* data, size_t len);
-    void gattTaskBody();
-    static void gattTaskStatic(void* param);
-    void gattWaitFinished(uint32_t timeoutMs);
 #endif
+
+    // Notify-capture state (guarded by mutex_).
+    std::map<uint16_t, std::string> notifyHandles_;  // handle -> uuid
+    std::map<uint16_t, std::string> notifyValues_;   // handle -> latest hex
+
+    // Helper: lazily create and take/give the shared-state mutex.  The mutex
+    // is created on first use because globals may be constructed before the
+    // FreeRTOS kernel is up.
+    void lock() const;
+    void unlock() const;
 };
 
 } // namespace mcp

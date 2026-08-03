@@ -476,21 +476,40 @@ void setup() {
             std::string out; serializeJson(doc, out); return out;
         });
 
-    // ble/connect — GATT client connect to a peer MAC.
+    // ble/connect — begin an asynchronous GATT connect to a peer MAC.  The
+    // attempt completes in the background within `timeoutMs`; poll the result
+    // via ble/connect/results.
     mcpServer.registerMethodHandler("ble/connect",
         [](uint8_t, uint32_t id, const JsonObject& p) -> std::string {
             std::string mac;
             if (p["mac"].is<const char*>()) mac = p["mac"].as<const char*>();
             uint32_t timeoutMs = p["timeoutMs"] | 5000u;
-            bool ok = false;
-            if (!mac.empty()) ok = bleScanner.connect(mac, timeoutMs);
+            if (mac.empty()) {
+                JsonDocument doc;
+                doc["jsonrpc"] = "2.0";
+                doc["id"]      = id;
+                doc["error"]["code"]    = -32602;
+                doc["error"]["message"] = "Invalid params: mac required";
+                std::string out; serializeJson(doc, out); return out;
+            }
+            bool started = bleScanner.connect(mac, timeoutMs);
             JsonDocument doc;
             doc["jsonrpc"] = "2.0";
             doc["id"] = id;
-            doc["result"]["ok"] = ok;
-            doc["result"]["connected"] = bleScanner.isConnected();
-            if (!ok && mac.empty())
-                doc["error"]["message"] = "mac required";
+            doc["result"]["started"]    = started;
+            doc["result"]["connecting"] = started && bleScanner.isConnecting();
+            doc["result"]["connected"]  = bleScanner.isConnected();
+            std::string out; serializeJson(doc, out); return out;
+        });
+
+    // ble/connect/results — poll the outcome of the last async connect.
+    mcpServer.registerMethodHandler("ble/connect/results",
+        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+            JsonDocument doc;
+            doc["jsonrpc"] = "2.0";
+            doc["id"] = id;
+            doc["result"]["connecting"] = bleScanner.isConnecting();
+            doc["result"]["connected"]  = bleScanner.isConnected();
             std::string out; serializeJson(doc, out); return out;
         });
 

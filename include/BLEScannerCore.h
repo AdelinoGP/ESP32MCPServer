@@ -29,6 +29,20 @@ struct BLEAdvReport {
     uint32_t    count;
 };
 
+// One GATT characteristic discovered on a connected device.
+struct BLECharInfo {
+    std::string uuid;
+    std::string properties;   // read/write/notify/indicate/...
+    std::string valueHex;     // last read / notified value (may be empty)
+    std::string valueText;    // printable ASCII of valueHex (may be empty)
+};
+
+// One GATT service discovered on a connected device.
+struct BLEServiceInfo {
+    std::string uuid;
+    std::vector<BLECharInfo> characteristics;
+};
+
 namespace blecore {
 
 // Bounds for the per-device payload history (tunable constants).

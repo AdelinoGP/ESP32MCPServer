@@ -2,30 +2,65 @@
 
 #include "BLEScanner.h"
 #include "BLEScannerCore.h"
-#include <BLEAddress.h>
 #include <BLEAdvertisedDevice.h>
-#include <BLEClient.h>
 #include <BLEDevice.h>
-#include <BLERemoteCharacteristic.h>
-#include <BLERemoteDescriptor.h>
-#include <BLERemoteService.h>
 #include <BLEScan.h>
-#include <BLEUUID.h>
-#include <BLEUtils.h>
 #include <ArduinoJson.h>
+#include <esp_gap_bt_api.h>
+#include <esp_gatt_defs.h>
+#include <esp_gattc_api.h>
 
 namespace mcp {
 
 using blecore::MAX_DEVICES;
-using blecore::MAX_PAYLOADS;
 using blecore::hexEncode;
 using blecore::hexToAscii;
 using blecore::payloadIsConnectable;
 using blecore::recordPayload;
+using gattcore::CLOSE_TIMEOUT_MS;
+using gattcore::DISCOVERY_TIMEOUT_MS;
+using gattcore::NOTIFY_CAPTURE_TIMEOUT_MS;
+using gattcore::READ_OP_TIMEOUT_MS;
+using gattcore::deadlineExpired;
+using gattcore::GattState;
+
+// Our GATT client application id (arbitrary, must not clash with the BLE
+// library's default app id).
+static constexpr uint16_t GATTC_APP_ID = 0x5C4E;  // "SCN" little-endian tag
 
 // ---------------------------------------------------------------------------
-// Advertising callback — merges duplicate reports per MAC so the raw payload
-// stays available even when a device does not re-advertise identical data.
+// Construction / destruction
+// ---------------------------------------------------------------------------
+
+BLEScanner::BLEScanner() {}
+
+BLEScanner::~BLEScanner() {
+    if (gattTaskHandle_ != nullptr) {
+        vTaskDelete(gattTaskHandle_);
+        gattTaskHandle_ = nullptr;
+    }
+    if (mutex_ != nullptr) {
+        vSemaphoreDelete(mutex_);
+        mutex_ = nullptr;
+    }
+}
+
+void BLEScanner::lock() const {
+    // The mutex is created lazily: globals are constructed before the
+    // FreeRTOS kernel is up, and the scanner may be used from a static
+    // initializer in main.cpp.
+    if (mutex_ == nullptr) {
+        mutex_ = xSemaphoreCreateRecursiveMutex();
+    }
+    xSemaphoreTakeRecursive(mutex_, portMAX_DELAY);
+}
+
+void BLEScanner::unlock() const {
+    xSemaphoreGiveRecursive(mutex_);
+}
+
+// ---------------------------------------------------------------------------
+// Advertising scanner
 // ---------------------------------------------------------------------------
 
 class ScannerCallback : public BLEAdvertisedDeviceCallbacks {
@@ -47,19 +82,44 @@ private:
 // watchdog.  The scan has already finished; clearing the flag is sufficient.
 static BLEScanner* g_instance = nullptr;
 void BLEScanner::onScanCompleteStatic(BLEScanResults) {
-    if (g_instance != nullptr) g_instance->scanning_ = false;
+    if (g_instance != nullptr) {
+        g_instance->lock();
+        g_instance->scanning_ = false;
+        g_instance->unlock();
+    }
+}
+
+// GATT client callback trampoline: the Arduino BLE library registered the
+// single Bluedroid gattc handler during BLEDevice::init(); we chain ours in
+// front of it and forward every event it does not know about, so library
+// internals and this scanner can coexist.
+static esp_gattc_cb_t s_prevGattcCb = nullptr;
+static void gattcTrampoline(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
+                            esp_ble_gattc_cb_param_t* param) {
+    if (g_instance != nullptr) {
+        g_instance->onGattcEvent(event, gattcIf, param);
+    }
+    if (s_prevGattcCb != nullptr) {
+        s_prevGattcCb(event, gattcIf, param);
+    }
 }
 
 void BLEScanner::begin() {
     BLEDevice::init("");
     g_instance = this;
+    esp_gattc_cb_t prev = esp_ble_gattc_get_callback();
+    s_prevGattcCb = prev;
+    esp_ble_gattc_register_callback(gattcTrampoline);
 }
 
 bool BLEScanner::startScan(uint32_t durationMs) {
-    if (scanning_) return false;
+    lock();
+    if (scanning_) { unlock(); return false; }
     reports_.clear();
     seenPayloads_.clear();
     scanning_ = true;
+    unlock();
+
     BLEScan* scan = BLEDevice::getScan();
     // wantDuplicates=true: deliver every advertisement to the callback so the
     // per-device payload history can capture payload changes.  The library
@@ -80,30 +140,44 @@ bool BLEScanner::startScan(uint32_t durationMs) {
 }
 
 void BLEScanner::stopScan() {
-    if (!scanning_) return;
+    lock();
+    if (!scanning_) { unlock(); return; }
     scanning_ = false;
+    unlock();
     BLEDevice::getScan()->stop();
 }
 
 bool BLEScanner::isScanning() const {
-    return scanning_;
+    lock();
+    bool s = scanning_;
+    unlock();
+    return s;
 }
 
 std::vector<BLEAdvReport> BLEScanner::getResults() {
-    return reports_;
+    lock();
+    std::vector<BLEAdvReport> out = reports_;
+    unlock();
+    return out;
 }
 
 size_t BLEScanner::reportCount() const {
-    return reports_.size();
+    lock();
+    size_t n = reports_.size();
+    unlock();
+    return n;
 }
 
 void BLEScanner::clearResults() {
+    lock();
     reports_.clear();
     seenPayloads_.clear();
+    unlock();
 }
 
 void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     if (adv == nullptr) return;
+    lock();
 
     std::string mac = adv->getAddress().toString();
     std::string payloadHex;
@@ -118,6 +192,7 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
         if (r.mac == mac) {
             r.rssi = adv->getRSSI();
             recordPayload(r.payloadHistory, r.count, seenPayloads_[r.mac], payloadHex);
+            unlock();
             return;
         }
     }
@@ -154,74 +229,185 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     reports_.push_back(rep);
     recordPayload(reports_.back().payloadHistory, reports_.back().count,
                   seenPayloads_[rep.mac], payloadHex);
+    unlock();
 }
 
 // ---------------------------------------------------------------------------
-// GATT client (two-phase: start / results / stop)
+// GATT client — raw esp_gattc state machine
+//
+// The 2.0.17 Arduino BLE library has no timeouts on its discovery/read
+// semaphores, so a slow or uncooperative peer blocks the MCP task forever.
+// This implementation drives the Bluedroid GATT client API directly, with
+// per-operation deadlines:
+//   * connect: timeoutMs on the open handshake (async, pollable)
+//   * discovery: DISCOVERY_TIMEOUT_MS on search_service
+//   * reads: READ_OP_TIMEOUT_MS per characteristic
+//   * notify capture: NOTIFY_CAPTURE_TIMEOUT_MS
+//   * close: CLOSE_TIMEOUT_MS
+//
+// Concurrency model: the GATT task is the ONLY task that issues controller
+// calls, and it snapshots all intent/state under the mutex BEFORE calling so
+// no controller API ever runs while the mutex is held.  Bluedroid callbacks
+// (onGattcEvent, chained after the library's handler) run on a stack task and
+// only record state under the mutex, scoped to our app id / interface /
+// connection id.  The task polls state at 20 ms, enforces every deadline, and
+// exits only from the Idle state — the connection is never freed underneath a
+// running operation.  Failed lifecycles go through Closing when a connection
+// may be open, so a late OPEN_EVT cannot leak the link.
 // ---------------------------------------------------------------------------
 
 bool BLEScanner::connect(const std::string& mac, uint32_t timeoutMs) {
-    if (connected_ || client_ != nullptr) return false;
-    BLEClient* client = BLEDevice::createClient();
-    if (client == nullptr) return false;
-    if (!client->connect(BLEAddress(mac))) {
-        client_ = nullptr;
-        return false;
-    }
-    client_ = client;
-    connected_ = true;
+    if (timeoutMs == 0) timeoutMs = 1;
+    esp_bd_addr_t addr;
+    int n = sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                   &addr[0], &addr[1], &addr[2], &addr[3], &addr[4], &addr[5]);
+    if (n != 6) return false;
+
+    lock();
+    if (connected_ || gattState_ != GattState::Idle) { unlock(); return false; }
     connectedMac_ = mac;
-    services_.clear();
-    notifyChars_.clear();
-    notifyValues_.clear();
+    memcpy(peerAddr_, addr, 6);
+    hasPeer_ = true;
+    connectTimeoutMs_ = timeoutMs;
+    openIssued_ = false;
+    registerIssued_ = false;
+    appRegistered_ = false;
+    closeIssued_ = false;
+    gattState_ = GattState::Connecting;
+    stateStartMillis_ = millis();
+    unlock();
+
+    ensureGattTask();
     return true;
 }
 
+bool BLEScanner::isConnecting() const {
+    lock();
+    bool c = gattState_ == GattState::Connecting;
+    unlock();
+    return c;
+}
+
+bool BLEScanner::getConnectResults() const {
+    lock();
+    bool ok = connected_;
+    unlock();
+    return ok;
+}
+
 void BLEScanner::disconnect() {
-    getServicesStop();
-    gattWaitFinished(2000);  // let the GATT task finish before freeing the client
-    if (client_ != nullptr) {
-        if (client_->isConnected()) client_->disconnect();
-        client_ = nullptr;
-    }
-    connected_ = false;
-    services_.clear();
+    lock();
+    bool hadConnection = gattStateConnected(gattState_) ||
+                         gattState_ == GattState::Connecting;
+    if (!hadConnection) { unlock(); return; }
+    gattState_ = GattState::Closing;
+    stateStartMillis_ = millis();
+    closeIssued_ = false;
+    unlock();
+    ensureGattTask();
 }
 
 bool BLEScanner::isConnected() const {
-    return connected_;
+    lock();
+    bool c = connected_;
+    unlock();
+    return c;
+}
+
+std::vector<BLEServiceInfo> BLEScanner::getServicesStart() {
+    lock();
+    std::vector<BLEServiceInfo> out = services_;
+    if (!connected_ || gattState_ != GattState::Connected) { unlock(); return out; }
+    gattState_ = GattState::Discovering;
+    stateStartMillis_ = millis();
+    searchIssued_ = false;
+    loadPending_ = false;
+    services_.clear();
+    pendingReads_.clear();
+    notifyHandles_.clear();
+    notifyValues_.clear();
+    unlock();
+
+    ensureGattTask();
+    return out;
+}
+
+std::vector<BLEServiceInfo> BLEScanner::getServicesResults(uint32_t notifyCaptureMs) {
+    // Wait for the enumeration to finish (bounded: 10 s discovery cap, then
+    // `notifyCaptureMs` for notified values).  Blocking here is fine — this is
+    // the caller's explicit results request.
+    lock();
+    uint32_t waited = 0;
+    const uint32_t enumLimit = notifyCaptureMs + DISCOVERY_TIMEOUT_MS;
+    bool busy = gattStateConnected(gattState_);
+    unlock();
+    while (busy && waited < enumLimit) {
+        delay(50);
+        waited += 50;
+        lock();
+        busy = gattStateConnected(gattState_);
+        unlock();
+    }
+
+    // Then wait for notified/indicated values to arrive.
+    lock();
+    bool hasNotifies = !notifyHandles_.empty();
+    unlock();
+    if (hasNotifies) {
+        waited = 0;
+        while (waited < notifyCaptureMs) {
+            delay(50);
+            waited += 50;
+            lock();
+            bool vals = !notifyValues_.empty();
+            bool ended = gattState_ == GattState::Connected ||
+                         gattState_ == GattState::Idle;
+            unlock();
+            if (vals || ended) break;
+        }
+    }
+
+    lock();
+    std::vector<BLEServiceInfo> out = services_;
+    // Fold any captured notified values into the response.
+    for (auto& [handle, uuid] : notifyHandles_) {
+        auto it = notifyValues_.find(handle);
+        if (it == notifyValues_.end()) continue;
+        for (auto& svc : out) {
+            for (auto& chr : svc.characteristics) {
+                if (chr.uuid == uuid) {
+                    chr.valueHex = it->second;
+                    chr.valueText = hexToAscii(chr.valueHex);
+                }
+            }
+        }
+    }
+    unlock();
+    return out;
+}
+
+void BLEScanner::getServicesStop() {
+    disconnect();
+}
+
+bool BLEScanner::isServicesBusy() const {
+    lock();
+    bool b = gattStateConnected(gattState_);
+    unlock();
+    return b;
 }
 
 // ---------------------------------------------------------------------------
-// GATT enumeration runs on a dedicated task: the 2.0.17 BLE library has no
-// timeouts on the discovery/read semaphores, so a slow or uncooperative peer
-// would otherwise block the MCP task forever.  The task signals completion
-// via a semaphore; getServicesResults() waits on it with a bound.
+// GATT task
 // ---------------------------------------------------------------------------
 
-std::vector<BLEServiceInfo> BLEScanner::getServicesStart() {
-    if (!connected_ || client_ == nullptr) return services_;
-    if (gattBusy_) return services_;
-
-    services_.clear();
-    notifyChars_.clear();
-    notifyValues_.clear();
-
-    if (gattDoneSem_ == nullptr) {
-        gattDoneSem_ = xSemaphoreCreateBinary();
-    } else {
-        xSemaphoreTake(gattDoneSem_, 0);  // discard any stale signal
+void BLEScanner::ensureGattTask() {
+    lock();
+    if (gattTaskHandle_ == nullptr) {
+        xTaskCreatePinnedToCore(gattTaskStatic, "BLEGattTask", 8192, this, 1,
+                                &gattTaskHandle_, 0);
     }
-    gattBusy_ = true;
-    gattCancelled_ = false;
-
-    if (gattTaskHandle_ != nullptr) {
-        vTaskDelete(gattTaskHandle_);  // previous task must have finished
-        gattTaskHandle_ = nullptr;
-    }
-    xTaskCreatePinnedToCore(gattTaskStatic, "BLEGattTask", 8192, this, 1,
-                            &gattTaskHandle_, 0);
-    return services_;
+    unlock();
 }
 
 void BLEScanner::gattTaskStatic(void* param) {
@@ -229,122 +415,468 @@ void BLEScanner::gattTaskStatic(void* param) {
 }
 
 void BLEScanner::gattTaskBody() {
-    // Enumerate services + characteristics; reads may take seconds on a slow
-    // peer.  The MCP task is never blocked by this.
-    for (auto& [uuid, svc] : *client_->getServices()) {
-        if (svc == nullptr) continue;
-        BLEServiceInfo si;
-        si.uuid = svc->getUUID().toString();
-
-        for (auto& [cuuid, chr] : *svc->getCharacteristics()) {
-            if (chr == nullptr) continue;
-            BLECharInfo ci;
-            ci.uuid = chr->getUUID().toString();
-
-            if (chr->canRead())            ci.properties += "read,";
-            if (chr->canWrite())           ci.properties += "write,";
-            if (chr->canWriteNoResponse()) ci.properties += "write-no-response,";
-            if (chr->canNotify())          ci.properties += "notify,";
-            if (chr->canIndicate())        ci.properties += "indicate,";
-            if (chr->canBroadcast())       ci.properties += "broadcast,";
-            if (!ci.properties.empty()) ci.properties.pop_back();
-
-            if (chr->canRead()) {
-                std::string val = chr->readValue();
-                ci.valueHex = hexEncode(reinterpret_cast<const uint8_t*>(val.data()),
-                                        val.length());
-                ci.valueText = hexToAscii(ci.valueHex);
+    for (;;) {
+        lock();
+        GattState st = gattState_;
+        uint32_t start = stateStartMillis_;
+        bool doRegister = false, doOpen = false, doSearch = false, doClose = false;
+        esp_gatt_if_t gif = 0;
+        uint16_t cid = 0;
+        esp_bd_addr_t peer;
+        memcpy(peer, peerAddr_, 6);
+        switch (st) {
+            case GattState::Connecting: {
+                if (!registerIssued_) {
+                    registerIssued_ = true;
+                    doRegister = true;
+                } else if (!appRegistered_ && !openIssued_ && gattcIf_ != 0) {
+                    openIssued_ = true;
+                    gif = gattcIf_;
+                    doOpen = true;
+                }
+                break;
             }
-
-            if (chr->canNotify() || chr->canIndicate()) {
-                chr->registerForNotify(
-                    [this](BLERemoteCharacteristic* c, uint8_t* data, size_t len, bool) {
-                        this->onNotify(c, data, len);
-                    },
-                    true);
-                notifyChars_[ci.uuid] = chr;
+            case GattState::Discovering: {
+                if (!searchIssued_ && connId_ != 0) {
+                    searchIssued_ = true;
+                    gif = gattcIf_;
+                    cid = connId_;
+                    doSearch = true;
+                }
+                break;
             }
-
-            si.characteristics.push_back(ci);
+            case GattState::Closing: {
+                if (!closeIssued_) {
+                    closeIssued_ = true;
+                    gif = gattcIf_;
+                    cid = connId_;
+                    doClose = true;
+                }
+                break;
+            }
+            default:
+                break;
         }
-        services_.push_back(si);
-        if (gattCancelled_) break;
+        unlock();
+
+        // Controller calls happen strictly outside the mutex.
+        if (doRegister) {
+            esp_ble_gattc_app_register(GATTC_APP_ID);
+        } else if (doOpen) {
+            esp_ble_gattc_open(gif, peer, BLE_ADDR_TYPE_PUBLIC, true);
+        } else if (doSearch) {
+            esp_ble_gattc_search_service(gif, cid, nullptr);
+        } else if (doClose) {
+            gattUnsubscribeAll();
+            if (cid != 0) {
+                esp_ble_gattc_close(gif, cid);
+            } else {
+                lock();
+                gattState_ = GattState::Idle;
+                connected_ = false;
+                hasPeer_ = false;
+                unlock();
+            }
+        }
+
+        // Deadline enforcement.
+        lock();
+        st = gattState_;
+        start = stateStartMillis_;
+        switch (st) {
+            case GattState::Connecting:
+                if (deadlineExpired(start, connectTimeoutMs_, millis())) gattFail();
+                break;
+            case GattState::Discovering:
+                if (deadlineExpired(start, DISCOVERY_TIMEOUT_MS, millis())) gattFail();
+                break;
+            case GattState::Reading:
+                if (deadlineExpired(start, READ_OP_TIMEOUT_MS, millis())) gattFail();
+                break;
+            case GattState::NotifyWait:
+                if (deadlineExpired(start, NOTIFY_CAPTURE_TIMEOUT_MS, millis())) {
+                    gattEnumDone();
+                }
+                break;
+            case GattState::Closing:
+                if (deadlineExpired(start, CLOSE_TIMEOUT_MS, millis())) gattFail();
+                break;
+            case GattState::Connected: {
+                // A discovery completed (loadPending_); load services now.
+                bool load = loadPending_;
+                if (load) loadPending_ = false;
+                unlock();
+                if (load) {
+                    gattLoadServices();
+                    continue;  // re-lock at the top of the loop
+                }
+                lock();  // re-acquire for the deadline switch below
+                break;
+            }
+            default:
+                break;
+        }
+        bool idle = (st == GattState::Idle);
+        unlock();
+
+        if (idle) break;  // all work done — exit the task
+        delay(20);
     }
 
-    gattBusy_ = false;
-    if (gattDoneSem_ != nullptr) xSemaphoreGive(gattDoneSem_);
+    lock();
     gattTaskHandle_ = nullptr;
+    unlock();
     vTaskDelete(nullptr);
 }
 
-void BLEScanner::onNotify(BLERemoteCharacteristic* chr, uint8_t* data, size_t len) {
-    if (chr == nullptr) return;
-    std::string value(data, data + len);
-    notifyValues_[chr->getUUID().toString()] = value;
-}
+// ---------------------------------------------------------------------------
+// GATT event handling (Bluedroid callback context)
+//
+// All events are scoped to our app id / interface / connection id so events
+// belonging to the Arduino library's own clients never touch our state.
+// ---------------------------------------------------------------------------
 
-std::vector<BLEServiceInfo> BLEScanner::getServicesResults(uint32_t notifyCaptureMs) {
-    // Wait for enumeration to finish (bounded by the caller's timeout).
-    uint32_t waited = 0;
-    const uint32_t enumLimit = notifyCaptureMs + 10000;  // 10s cap on discovery
-    while (gattBusy_ && waited < enumLimit) {
-        delay(50);
-        waited += 50;
-    }
+void BLEScanner::onGattcEvent(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
+                              esp_ble_gattc_cb_param_t* param) {
+    if (param == nullptr) return;
 
-    // Then wait for notified/indicated values to arrive.
-    waited = 0;
-    while (!notifyChars_.empty() && waited < notifyCaptureMs) {
-        delay(50);
-        waited += 50;
-        if (!notifyValues_.empty()) {
-            for (auto& [uuid, val] : notifyValues_) {
+    switch (event) {
+        case ESP_GATTC_REG_EVT: {
+            lock();
+            if (param->reg.app_id == GATTC_APP_ID) {
+                gattcIf_ = gattcIf;
+                appRegistered_ = true;
+            }
+            unlock();
+            break;
+        }
+        case ESP_GATTC_OPEN_EVT: {
+            lock();
+            if (gattcIf != gattcIf_) { unlock(); break; }
+            if (gattState_ == GattState::Connecting) {
+                if (param->open.status != ESP_GATT_OK) {
+                    gattFail();
+                } else {
+                    connId_ = param->open.conn_id;
+                    connected_ = true;
+                    gattState_ = GattState::Connected;
+                    stateStartMillis_ = millis();
+                }
+                unlock();
+            } else if (gattState_ == GattState::Idle) {
+                // Late open after a failed/aborted attempt — close it
+                // immediately so the link does not leak.
+                uint16_t cid = param->open.conn_id;
+                unlock();
+                esp_ble_gattc_close(gattcIf, cid);
+            } else {
+                unlock();
+            }
+            break;
+        }
+        case ESP_GATTC_SEARCH_CMPL_EVT: {
+            lock();
+            if (gattcIf == gattcIf_ && param->search_cmpl.conn_id == connId_ &&
+                gattState_ == GattState::Discovering) {
+                loadPending_ = true;
+            }
+            unlock();
+            break;
+        }
+        case ESP_GATTC_READ_CHAR_EVT: {
+            lock();
+            if (gattcIf != gattcIf_ || param->read.conn_id != connId_) { unlock(); break; }
+            auto it = pendingReads_.find(param->read.handle);
+            if (it == pendingReads_.end()) { unlock(); break; }
+            std::string uuid = it->second;
+            pendingReads_.erase(it);
+            if (param->read.status == ESP_GATT_OK && param->read.value_len > 0) {
+                std::string val(reinterpret_cast<const char*>(param->read.value),
+                                param->read.value_len);
+                std::string hex = hexEncode(reinterpret_cast<const uint8_t*>(val.data()),
+                                            val.length());
                 for (auto& svc : services_) {
                     for (auto& chr : svc.characteristics) {
                         if (chr.uuid == uuid) {
-                            chr.valueHex = hexEncode(
-                                reinterpret_cast<const uint8_t*>(val.data()),
-                                val.length());
-                            chr.valueText = hexToAscii(chr.valueHex);
+                            chr.valueHex = hex;
+                            chr.valueText = hexToAscii(hex);
                         }
                     }
                 }
             }
-            notifyValues_.clear();
+            if (pendingReads_.empty() && gattState_ == GattState::Reading) {
+                if (notifyHandles_.empty()) {
+                    gattEnumDone();
+                    unlock();
+                } else {
+                    gattState_ = GattState::NotifyWait;
+                    stateStartMillis_ = millis();
+                    unlock();
+                    gattSubscribeAll();
+                }
+            } else {
+                unlock();
+            }
+            break;
+        }
+        case ESP_GATTC_NOTIFY_EVT: {
+            lock();
+            if (gattcIf != gattcIf_ || param->notify.conn_id != connId_) { unlock(); break; }
+            std::string val(reinterpret_cast<const char*>(param->notify.value),
+                            param->notify.value_len);
+            std::string hex = hexEncode(reinterpret_cast<const uint8_t*>(val.data()),
+                                        val.length());
+            notifyValues_[param->notify.handle] = hex;
+            unlock();
+            break;
+        }
+        case ESP_GATTC_DISCONNECT_EVT: {
+            lock();
+            if (gattcIf == gattcIf_ &&
+                (connId_ == 0 || param->disconnect.conn_id == connId_)) {
+                gattState_ = GattState::Idle;
+                connected_ = false;
+                hasPeer_ = false;
+                connId_ = 0;
+            }
+            unlock();
+            break;
+        }
+        case ESP_GATTC_CLOSE_EVT: {
+            lock();
+            if (gattcIf == gattcIf_ && param->close.conn_id == connId_) {
+                gattState_ = GattState::Idle;
+                connected_ = false;
+                hasPeer_ = false;
+                connId_ = 0;
+            }
+            unlock();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GATT helpers
+// ---------------------------------------------------------------------------
+
+static gattcore::RawUuid rawUuidOf(const esp_bt_uuid_t& u) {
+    gattcore::RawUuid out;
+    out.len = u.len;
+    if (u.len == ESP_UUID_LEN_16) {
+        out.u16 = u.uuid.uuid16;
+    } else if (u.len == ESP_UUID_LEN_32) {
+        out.u32 = u.uuid.uuid32;
+    } else if (u.len == ESP_UUID_LEN_128) {
+        memcpy(out.u128, u.uuid.uuid128, ESP_UUID_LEN_128);
+    }
+    return out;
+}
+
+void BLEScanner::gattLoadServices() {
+    // Snapshot the discovered database from the Bluedroid cache WITHOUT the
+    // mutex held (controller calls must never run under the lock).  The
+    // database is owned by the stack and only valid for the duration of this
+    // call, so copy the elements we need into local structures.
+    lock();
+    esp_gatt_if_t gif = gattcIf_;
+    uint16_t cid = connId_;
+    unlock();
+    if (cid == 0) return;
+
+    uint16_t count = 0;
+    if (esp_ble_gattc_get_attr_count(gif, cid, ESP_GATT_DB_ALL,
+                                     1, 0xFFFF, 0, &count) != ESP_OK || count == 0) {
+        lock();
+        services_.clear();
+        gattEnumDone();
+        unlock();
+        return;
+    }
+    esp_gattc_db_elem_t* db = new esp_gattc_db_elem_t[count];
+    uint16_t got = count;
+    if (esp_ble_gattc_get_db(gif, cid, 1, 0xFFFF, db, &got) != ESP_OK) {
+        delete[] db;
+        lock();
+        services_.clear();
+        gattEnumDone();
+        unlock();
+        return;
+    }
+
+    // Group characteristics under their owning service by handle range.
+    struct SvcRange {
+        uint16_t start, end;
+        gattcore::RawUuid uuid;
+    };
+    std::vector<SvcRange> svcs;
+    std::vector<esp_gattc_db_elem_t> chars;
+    for (uint16_t i = 0; i < got; ++i) {
+        if (db[i].type == ESP_GATT_DB_PRIMARY_SERVICE ||
+            db[i].type == ESP_GATT_DB_SECONDARY_SERVICE) {
+            SvcRange r;
+            r.start = db[i].start_handle;
+            r.end = db[i].end_handle;
+            r.uuid = rawUuidOf(db[i].uuid);
+            svcs.push_back(r);
+        } else if (db[i].type == ESP_GATT_DB_CHARACTERISTIC) {
+            chars.push_back(db[i]);
         }
     }
-    return services_;
+    delete[] db;
+
+    lock();
+    services_.clear();
+    for (auto& r : svcs) {
+        BLEServiceInfo si;
+        si.uuid = gattcore::uuidToString(r.uuid);
+        for (auto& ch : chars) {
+            if (ch.attribute_handle < r.start || ch.attribute_handle > r.end) {
+                continue;
+            }
+            BLECharInfo ci;
+            ci.uuid = gattcore::uuidToString(rawUuidOf(ch.uuid));
+            ci.properties = gattcore::propertiesString(ch.properties);
+            si.characteristics.push_back(ci);
+            if (ch.properties & ESP_GATT_CHAR_PROP_BIT_READ) {
+                pendingReads_[ch.attribute_handle] = ci.uuid;
+            }
+            if (ch.properties & (ESP_GATT_CHAR_PROP_BIT_NOTIFY |
+                                 ESP_GATT_CHAR_PROP_BIT_INDICATE)) {
+                notifyHandles_[ch.attribute_handle] = ci.uuid;
+            }
+        }
+        services_.push_back(si);
+    }
+    unlock();
+
+    gattStartReads();
 }
 
-void BLEScanner::getServicesStop() {
-    // Ask the discovery task to bail out early if it is still running.
-    if (gattBusy_) gattCancelled_ = true;
-    // Unsubscribe to keep the stack clean.
-    for (auto& [uuid, chr] : notifyChars_) {
-        if (chr != nullptr) chr->registerForNotify(nullptr, false);
+void BLEScanner::gattStartReads() {
+    lock();
+    if (pendingReads_.empty()) {
+        if (notifyHandles_.empty()) {
+            gattEnumDone();
+        } else {
+            gattState_ = GattState::NotifyWait;
+            stateStartMillis_ = millis();
+            unlock();
+            gattSubscribeAll();
+            return;
+        }
+        unlock();
+        return;
     }
-    notifyChars_.clear();
-    notifyValues_.clear();
+    gattState_ = GattState::Reading;
+    stateStartMillis_ = millis();
+    esp_gatt_if_t gif = gattcIf_;
+    uint16_t cid = connId_;
+    auto reads = pendingReads_;
+    unlock();
+
+    // Fire all reads; each is answered by READ_CHAR_EVT.
+    for (auto& [handle, uuid] : reads) {
+        esp_ble_gattc_read_char(gif, cid, handle, ESP_GATT_AUTH_REQ_NONE);
+    }
 }
 
-void BLEScanner::gattWaitFinished(uint32_t timeoutMs) {
-    if (!gattBusy_) return;
-    if (gattDoneSem_ != nullptr) {
-        xSemaphoreTake(gattDoneSem_, pdMS_TO_TICKS(timeoutMs));
-    }
-    // The task clears gattBusy_ itself when it exits.
-    uint32_t waited = 0;
-    while (gattBusy_ && waited < timeoutMs) {
-        delay(10);
-        waited += 10;
-    }
-    if (gattTaskHandle_ != nullptr && !gattBusy_) {
-        gattTaskHandle_ = nullptr;
+void BLEScanner::gattEnumDone() {
+    // Mutex held by the caller.  The enumeration is complete; the connection
+    // stays open so the caller can poll results or stop it explicitly.
+    if (gattState_ == GattState::Reading || gattState_ == GattState::NotifyWait) {
+        gattState_ = GattState::Connected;
+        stateStartMillis_ = millis();
     }
 }
 
-bool BLEScanner::isServicesBusy() const {
-    return gattBusy_;
+void BLEScanner::gattFail() {
+    // Mutex held by the caller.  If a connection may be open, route through
+    // Closing so the link is torn down (and a late OPEN_EVT cannot leak it);
+    // otherwise drop straight to Idle.
+    bool connMayBeOpen = connId_ != 0 ||
+                         gattState_ == GattState::Connected ||
+                         gattState_ == GattState::Discovering ||
+                         gattState_ == GattState::Reading ||
+                         gattState_ == GattState::NotifyWait;
+    if (connMayBeOpen) {
+        gattState_ = GattState::Closing;
+        stateStartMillis_ = millis();
+        closeIssued_ = false;
+    } else {
+        gattState_ = GattState::Idle;
+        connected_ = false;
+        hasPeer_ = false;
+        connId_ = 0;
+        pendingReads_.clear();
+        notifyHandles_.clear();
+    }
+}
+
+void BLEScanner::gattSubscribeAll() {
+    // Enable notifications: write 0x0001 to the CCCD of each notifiable
+    // characteristic.  Cache lookups run without the lock (they are fast
+    // local reads); the write is issued outside the lock too.  The write
+    // response (WRITE_DESCR_EVT) is deliberately ignored; notifications start
+    // as soon as the peer enables them.
+    lock();
+    esp_gatt_if_t gif = gattcIf_;
+    uint16_t cid = connId_;
+    auto handles = notifyHandles_;
+    unlock();
+
+    std::vector<uint16_t> cccdHandles;
+    esp_bt_uuid_t cccdUuid;
+    cccdUuid.len = ESP_UUID_LEN_16;
+    cccdUuid.uuid.uuid16 = 0x2902;
+    for (auto& [handle, uuid] : handles) {
+        esp_gattc_descr_elem_t descr;
+        uint16_t n = 1;
+        if (esp_ble_gattc_get_descr_by_char_handle(gif, cid, handle,
+                                                   cccdUuid, &descr, &n) == ESP_OK && n > 0) {
+            cccdHandles.push_back(descr.handle);
+        }
+    }
+    for (uint16_t dh : cccdHandles) {
+        uint8_t val[2] = {0x01, 0x00};
+        esp_ble_gattc_write_char_descr(gif, cid, dh, sizeof(val), val,
+                                       ESP_GATT_WRITE_TYPE_RSP,
+                                       ESP_GATT_AUTH_REQ_NONE);
+    }
+}
+
+void BLEScanner::gattUnsubscribeAll() {
+    // Disable notifications by writing 0x0000 to each CCCD.  Same structure
+    // as gattSubscribeAll; the connection is usually closed right after.
+    lock();
+    esp_gatt_if_t gif = gattcIf_;
+    uint16_t cid = connId_;
+    auto handles = notifyHandles_;
+    unlock();
+
+    std::vector<uint16_t> cccdHandles;
+    esp_bt_uuid_t cccdUuid;
+    cccdUuid.len = ESP_UUID_LEN_16;
+    cccdUuid.uuid.uuid16 = 0x2902;
+    for (auto& [handle, uuid] : handles) {
+        esp_gattc_descr_elem_t descr;
+        uint16_t n = 1;
+        if (esp_ble_gattc_get_descr_by_char_handle(gif, cid, handle,
+                                                   cccdUuid, &descr, &n) == ESP_OK && n > 0) {
+            cccdHandles.push_back(descr.handle);
+        }
+    }
+    for (uint16_t dh : cccdHandles) {
+        uint8_t val[2] = {0x00, 0x00};
+        esp_ble_gattc_write_char_descr(gif, cid, dh, sizeof(val), val,
+                                       ESP_GATT_WRITE_TYPE_RSP,
+                                       ESP_GATT_AUTH_REQ_NONE);
+    }
+    lock();
+    notifyHandles_.clear();
+    unlock();
 }
 
 } // namespace mcp
