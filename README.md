@@ -539,8 +539,10 @@ Active BLE advertising capture for reverse-engineering broadcast formats, plus o
 
 | Method | Params | Description |
 |---|---|---|
-| `ble/scan` | `durationMs?` | Start a scan (default 5000 ms); returns immediately |
-| `ble/scan/results` | `mac?` | Stop the scan (if running) and return captured devices; optional case-insensitive `mac` returns only that device with its **full** payload history |
+| `ble/scan` | `durationMs?` | Start a scan (default 5000 ms; 0 = continuous until `ble/scan/stop`); returns immediately. If a scan is already running: `{started:false, scanning:true, remainingMs}` |
+| `ble/scan/results` | `mac?`, `serviceUuid?`, `manufacturerId?`, `macPrefix?` | Stop the scan (if running) and return captured devices; optional case-insensitive `mac` returns only that device with its **full** payload history; optional AND-combined response filters (`serviceUuid`, `manufacturerId` hex, `macPrefix`) never affect capture |
+| `ble/scan/payloads` | — | Stop the scan and return the **MAC-independent payload registry**: distinct payloads across ALL broadcasters, first-seen order, with `count` + `firstSeen`/`lastSeen` (ms since scan start). The primary artifact for protocol reverse-engineering — survives per-MAC MAC-rotation churn |
+| `ble/scan/poll` | — | Live read of the payload registry WITHOUT stopping the scan (stateless; diff by `firstSeen`) |
 | `ble/scan/stop` | — | Stop a continuous scan early |
 | `ble/connect` | `mac`, `timeoutMs?` | Begin an **asynchronous** GATT connect to a peer MAC (default timeout 5000 ms) |
 | `ble/connect/results` | — | Poll the outcome of the last async connect |

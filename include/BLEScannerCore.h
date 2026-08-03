@@ -29,6 +29,18 @@ struct BLEAdvReport {
     uint32_t    count;
 };
 
+// One entry of the MAC-independent payload registry: a distinct payload as
+// seen across ALL broadcasters during a scan, in first-seen order, with the
+// number of times it was observed and its first/last observation times.
+// The phone rotating its MAC every ~1s means per-device history never
+// accumulates; the registry is the artifact that captures the command surface.
+struct BLEPayloadEntry {
+    std::string payload;   // truncated hex, dedupe key
+    uint32_t    count;     // broadcasts observed (across all MACs)
+    uint64_t    firstSeen; // millis() of first observation
+    uint64_t    lastSeen;  // millis() of last observation
+};
+
 // One GATT characteristic discovered on a connected device.
 struct BLECharInfo {
     std::string uuid;
@@ -69,6 +81,12 @@ constexpr size_t MAX_PAYLOADS_VIEW = 4;    // payloads serialised by the unfilte
 // flooded by chatty broadcasters.
 constexpr size_t MAX_PAYLOAD_BYTES = 64;
 constexpr size_t MAX_PAYLOAD_HEX   = MAX_PAYLOAD_BYTES * 2;
+// Cap on the MAC-independent payload registry: distinct payloads across ALL
+// broadcasters in a scan, in first-seen order.  This is the artifact that
+// captures a full command surface in one scan despite per-MAC MAC-rotation
+// churn (e.g. the phone rotating its MAC every ~1s).  64 covers the whole
+// LoveSpouse command vocabulary (~30 commands) with margin.
+constexpr size_t MAX_REGISTRY_PAYLOADS = 64;
 
 // Encode raw bytes as lowercase hex ("" for empty input).
 inline std::string hexEncode(const uint8_t* data, size_t len) {
@@ -154,6 +172,35 @@ inline void recordPayload(std::vector<std::string>& history, uint32_t& count,
         history.erase(history.begin());
     }
     count = static_cast<uint32_t>(history.size());
+}
+
+// Record a payload into the MAC-independent registry.  The registry is
+// insertion-ordered (first-seen order), deduped on the truncated hex form,
+// and bounded to MAX_REGISTRY_PAYLOADS entries (when full, new distinct
+// payloads are ignored).  Unlike the per-MAC history it is NOT subject to
+// device eviction, so it survives a flood of rotating MACs.  `now` is the
+// millis() at observation time; the caller is responsible for locking.
+inline void recordRegistryPayload(std::vector<BLEPayloadEntry>& registry,
+                                  const std::string& payloadHex, uint64_t now) {
+    if (payloadHex.empty()) return;
+    std::string stored = payloadHex;
+    if (stored.length() > MAX_PAYLOAD_HEX) {
+        stored.resize(MAX_PAYLOAD_HEX);
+    }
+    for (auto& e : registry) {
+        if (e.payload == stored) {
+            e.count++;
+            e.lastSeen = now;
+            return;
+        }
+    }
+    if (registry.size() >= MAX_REGISTRY_PAYLOADS) return;  // registry full
+    BLEPayloadEntry e;
+    e.payload = stored;
+    e.count = 1;
+    e.firstSeen = now;
+    e.lastSeen = now;
+    registry.push_back(e);
 }
 
 } // namespace blecore

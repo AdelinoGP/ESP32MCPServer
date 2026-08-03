@@ -77,6 +77,15 @@ public:
     // Snapshot of all reports captured since the last scan start.
     std::vector<BLEAdvReport> getResults();
 
+    // MAC-independent payload registry snapshot (first-seen order).
+    std::vector<BLEPayloadEntry> getPayloadRegistry();
+
+    // millis() when the current/last scan started.
+    uint64_t getScanStartedAt() const;
+
+    // Requested scan duration in ms (0 = continuous).
+    uint32_t getScanDurationMs() const;
+
     // Number of reports in the current snapshot.
     size_t reportCount() const;
 
@@ -159,6 +168,10 @@ private:
     std::vector<BLEAdvReport> reports_;
     // MAC -> set of payloads already recorded for that device (dedupe).
     std::map<std::string, std::map<std::string, bool>> seenPayloads_;
+    // MAC-independent distinct payload registry (first-seen order).
+    std::vector<BLEPayloadEntry> payloadRegistry_;
+    uint64_t scanStartedAt_ = 0;   // millis() at scan start
+    uint32_t scanDurationMs_ = 0;  // requested duration (0 = continuous)
     std::vector<BLEServiceInfo> services_;
 
 #ifndef NATIVE_TEST

@@ -6,6 +6,7 @@
 #include <vector>
 
 using namespace mcp::blecore;
+using mcp::BLEPayloadEntry;
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -237,6 +238,72 @@ void test_view_slice_returns_whole_history_when_shallow(void) {
     TEST_ASSERT_EQUAL_STRING("0103", view[1].c_str());
 }
 
+// ---------------------------------------------------------------------------
+// MAC-independent payload registry
+// ---------------------------------------------------------------------------
+
+void test_registry_accumulates_count_and_timestamps(void) {
+    std::vector<BLEPayloadEntry> reg;
+    recordRegistryPayload(reg, "0102", 1000);
+    recordRegistryPayload(reg, "0102", 1500);
+    recordRegistryPayload(reg, "0102", 2000);
+    TEST_ASSERT_EQUAL(1, reg.size());
+    TEST_ASSERT_EQUAL_STRING("0102", reg[0].payload.c_str());
+    TEST_ASSERT_EQUAL_UINT32(3, reg[0].count);
+    TEST_ASSERT_EQUAL_UINT64(1000, reg[0].firstSeen);
+    TEST_ASSERT_EQUAL_UINT64(2000, reg[0].lastSeen);
+}
+
+void test_registry_appends_distinct_in_first_seen_order(void) {
+    std::vector<BLEPayloadEntry> reg;
+    recordRegistryPayload(reg, "0102", 1000);
+    recordRegistryPayload(reg, "0304", 1100);
+    recordRegistryPayload(reg, "0102", 1200);
+    TEST_ASSERT_EQUAL(2, reg.size());
+    TEST_ASSERT_EQUAL_STRING("0102", reg[0].payload.c_str());
+    TEST_ASSERT_EQUAL_STRING("0304", reg[1].payload.c_str());
+    TEST_ASSERT_EQUAL_UINT32(2, reg[0].count);
+}
+
+void test_registry_truncates_and_dedupes_on_truncated_form(void) {
+    std::vector<BLEPayloadEntry> reg;
+    std::string longA, longB;
+    for (int i = 0; i < 100; ++i) {
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02x", i & 0xFF);
+        longA += hex;
+    }
+    longB = longA.substr(0, MAX_PAYLOAD_HEX) + "deadbeef";
+    recordRegistryPayload(reg, longA, 1000);
+    recordRegistryPayload(reg, longB, 2000);
+    // Both truncate to the identical stored string -> one entry, count 2.
+    TEST_ASSERT_EQUAL(1, reg.size());
+    TEST_ASSERT_EQUAL(MAX_PAYLOAD_HEX, reg[0].payload.length());
+    TEST_ASSERT_EQUAL_UINT32(2, reg[0].count);
+    TEST_ASSERT_EQUAL_UINT64(1000, reg[0].firstSeen);
+    TEST_ASSERT_EQUAL_UINT64(2000, reg[0].lastSeen);
+}
+
+void test_registry_bounds_at_max_and_ignores_new_distinct(void) {
+    std::vector<BLEPayloadEntry> reg;
+    for (int i = 0; i < MAX_REGISTRY_PAYLOADS + 10; ++i) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
+        recordRegistryPayload(reg, hex, 1000 + i);
+    }
+    TEST_ASSERT_EQUAL(MAX_REGISTRY_PAYLOADS, reg.size());
+    // Re-broadcasts of an existing payload still count while full.
+    recordRegistryPayload(reg, "0001", 99999);
+    TEST_ASSERT_EQUAL(MAX_REGISTRY_PAYLOADS, reg.size());
+    TEST_ASSERT_EQUAL_UINT32(2, reg[0].count);
+}
+
+void test_registry_empty_ignored(void) {
+    std::vector<BLEPayloadEntry> reg;
+    recordRegistryPayload(reg, "", 1000);
+    TEST_ASSERT_EQUAL(0, reg.size());
+}
+
 void test_record_payload_truncates_long_payloads(void) {
     std::vector<std::string> hist;
     uint32_t count = 0;
@@ -305,6 +372,11 @@ int runUnityTests(void) {
     RUN_TEST(test_record_payload_truncation_deduplicates_to_common_prefix);
     RUN_TEST(test_view_slice_returns_newest_four_when_history_deep);
     RUN_TEST(test_view_slice_returns_whole_history_when_shallow);
+    RUN_TEST(test_registry_accumulates_count_and_timestamps);
+    RUN_TEST(test_registry_appends_distinct_in_first_seen_order);
+    RUN_TEST(test_registry_truncates_and_dedupes_on_truncated_form);
+    RUN_TEST(test_registry_bounds_at_max_and_ignores_new_distinct);
+    RUN_TEST(test_registry_empty_ignored);
     return UNITY_END();
 }
 

@@ -113,6 +113,9 @@ bool BLEScanner::startScan(uint32_t durationMs) {
     if (scanning_) { unlock(); return false; }
     reports_.clear();
     seenPayloads_.clear();
+    payloadRegistry_.clear();
+    scanDurationMs_ = durationMs;
+    scanStartedAt_ = millis();
     scanning_ = true;
     unlock();
 
@@ -127,10 +130,10 @@ bool BLEScanner::startScan(uint32_t durationMs) {
     scan->setInterval(100);
     scan->setWindow(99);
     // Non-blocking start: the completion callback fires when the duration
-    // elapses; the MCP task must never block on the scan.  Round milliseconds
-    // UP to whole seconds (0 would mean continuous scan until stop()).
-    uint32_t seconds = (durationMs + 999) / 1000;
-    if (seconds == 0) seconds = 1;
+    // elapses; the MCP task must never block on the scan.  0 = continuous
+    // scan until stop() (stopScan/ble/scan/stop); round milliseconds UP to
+    // whole seconds for one-shot scans.
+    uint32_t seconds = durationMs == 0 ? 0 : (durationMs + 999) / 1000;
     scan->start(seconds, onScanCompleteStatic, false);
     return true;
 }
@@ -155,6 +158,27 @@ std::vector<BLEAdvReport> BLEScanner::getResults() {
     std::vector<BLEAdvReport> out = reports_;
     unlock();
     return out;
+}
+
+std::vector<BLEPayloadEntry> BLEScanner::getPayloadRegistry() {
+    lock();
+    std::vector<BLEPayloadEntry> out = payloadRegistry_;
+    unlock();
+    return out;
+}
+
+uint64_t BLEScanner::getScanStartedAt() const {
+    lock();
+    uint64_t t = scanStartedAt_;
+    unlock();
+    return t;
+}
+
+uint32_t BLEScanner::getScanDurationMs() const {
+    lock();
+    uint32_t d = scanDurationMs_;
+    unlock();
+    return d;
 }
 
 size_t BLEScanner::reportCount() const {
@@ -188,6 +212,10 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
         if (r.mac == mac) {
             r.rssi = adv->getRSSI();
             recordPayload(r.payloadHistory, r.count, seenPayloads_[r.mac], payloadHex);
+            // MAC-independent registry: also record across all broadcasters.
+            if (!payloadHex.empty()) {
+                blecore::recordRegistryPayload(payloadRegistry_, payloadHex, millis());
+            }
             unlock();
             return;
         }
@@ -225,6 +253,10 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     reports_.push_back(rep);
     recordPayload(reports_.back().payloadHistory, reports_.back().count,
                   seenPayloads_[rep.mac], payloadHex);
+    // MAC-independent registry: record the payload across all broadcasters.
+    if (!payloadHex.empty()) {
+        blecore::recordRegistryPayload(payloadRegistry_, payloadHex, millis());
+    }
     unlock();
 }
 
