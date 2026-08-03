@@ -90,26 +90,22 @@ void BLEScanner::onScanCompleteStatic(BLEScanResults) {
 }
 
 // GATT client callback trampoline: the Arduino BLE library registered the
-// single Bluedroid gattc handler during BLEDevice::init(); we chain ours in
-// front of it and forward every event it does not know about, so library
-// internals and this scanner can coexist.
-static esp_gattc_cb_t s_prevGattcCb = nullptr;
+// single Bluedroid gattc handler during BLEDevice::init(); we chain ours via
+// its official extension point (setCustomGattcHandler) and forward every event
+// it does not know about, so library internals and this scanner can coexist.
+// (esp_ble_gattc_register_callback must NOT be called again — the Bluedroid
+// registration is one-shot; a second call silently fails.)
 static void gattcTrampoline(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
                             esp_ble_gattc_cb_param_t* param) {
     if (g_instance != nullptr) {
         g_instance->onGattcEvent(event, gattcIf, param);
-    }
-    if (s_prevGattcCb != nullptr) {
-        s_prevGattcCb(event, gattcIf, param);
     }
 }
 
 void BLEScanner::begin() {
     BLEDevice::init("");
     g_instance = this;
-    esp_gattc_cb_t prev = esp_ble_gattc_get_callback();
-    s_prevGattcCb = prev;
-    esp_ble_gattc_register_callback(gattcTrampoline);
+    BLEDevice::setCustomGattcHandler(gattcTrampoline);
 }
 
 bool BLEScanner::startScan(uint32_t durationMs) {
@@ -426,10 +422,10 @@ void BLEScanner::gattTaskBody() {
         memcpy(peer, peerAddr_, 6);
         switch (st) {
             case GattState::Connecting: {
-                if (!registerIssued_) {
+                if (!appRegistered_ && !registerIssued_) {
                     registerIssued_ = true;
                     doRegister = true;
-                } else if (!appRegistered_ && !openIssued_ && gattcIf_ != 0) {
+                } else if (appRegistered_ && !openIssued_ && gattcIf_ != 0) {
                     openIssued_ = true;
                     gif = gattcIf_;
                     doOpen = true;
@@ -437,7 +433,9 @@ void BLEScanner::gattTaskBody() {
                 break;
             }
             case GattState::Discovering: {
-                if (!searchIssued_ && connId_ != 0) {
+                // conn_id may legitimately be 0 on this stack (first GATT
+                // connection); the state itself guarantees a connection.
+                if (!searchIssued_) {
                     searchIssued_ = true;
                     gif = gattcIf_;
                     cid = connId_;
@@ -468,15 +466,9 @@ void BLEScanner::gattTaskBody() {
             esp_ble_gattc_search_service(gif, cid, nullptr);
         } else if (doClose) {
             gattUnsubscribeAll();
-            if (cid != 0) {
-                esp_ble_gattc_close(gif, cid);
-            } else {
-                lock();
-                gattState_ = GattState::Idle;
-                connected_ = false;
-                hasPeer_ = false;
-                unlock();
-            }
+            // conn_id may be 0 (first GATT connection on this stack); the
+            // Closing state itself guarantees a connection exists.
+            esp_ble_gattc_close(gif, cid);
         }
 
         // Deadline enforcement.
@@ -543,7 +535,7 @@ void BLEScanner::onGattcEvent(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
     switch (event) {
         case ESP_GATTC_REG_EVT: {
             lock();
-            if (param->reg.app_id == GATTC_APP_ID) {
+            if (param->reg.app_id == GATTC_APP_ID && param->reg.status == ESP_GATT_OK) {
                 gattcIf_ = gattcIf;
                 appRegistered_ = true;
             }
@@ -579,6 +571,10 @@ void BLEScanner::onGattcEvent(esp_gattc_cb_event_t event, esp_gatt_if_t gattcIf,
             if (gattcIf == gattcIf_ && param->search_cmpl.conn_id == connId_ &&
                 gattState_ == GattState::Discovering) {
                 loadPending_ = true;
+                // Discovery succeeded: move to Connected so the task loop's
+                // Connected case picks up the load request.
+                gattState_ = GattState::Connected;
+                stateStartMillis_ = millis();
             }
             unlock();
             break;
@@ -684,11 +680,11 @@ void BLEScanner::gattLoadServices() {
     esp_gatt_if_t gif = gattcIf_;
     uint16_t cid = connId_;
     unlock();
-    if (cid == 0) return;
 
     uint16_t count = 0;
-    if (esp_ble_gattc_get_attr_count(gif, cid, ESP_GATT_DB_ALL,
-                                     1, 0xFFFF, 0, &count) != ESP_OK || count == 0) {
+    esp_gatt_status_t rcCount = esp_ble_gattc_get_attr_count(gif, cid, ESP_GATT_DB_ALL,
+                                                             1, 0xFFFF, 0, &count);
+    if (rcCount != ESP_OK || count == 0) {
         lock();
         services_.clear();
         gattEnumDone();
