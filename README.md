@@ -21,7 +21,7 @@ Connect an AI agent directly to your hardware: query I2C sensors, parse NMEA 018
 | **OBD-II / CAN** | Standard 11-bit OBD-II service 01/09 PID decoding (60+ PIDs) |
 | **Bus History** | Persistent ring buffers for CAN, NMEA, NMEA 2000, OBD-II — queryable via MCP |
 | **Bus Readers** | Time-bounded serial and CAN reads, raw or parsed mode, JSON output |
-| **Bluetooth (BLE)** | Passive advertising scanner (raw payload capture + history) and GATT enumeration — queryable via MCP |
+| **Bluetooth (BLE)** | Active advertising scanner (raw payload capture + history) and GATT enumeration — queryable via MCP |
 | **WiFi** | AP setup UI + STA mode; credentials stored in NVS |
 | **Discovery** | mDNS (`_mcp._tcp`) + UDP capability broadcast |
 | **Metrics** | Heap, uptime, RSSI, histogram stats with boot persistence |
@@ -531,18 +531,19 @@ After subscribing the server pushes unsolicited `notifications/resources/updated
 
 ### Bluetooth (BLE)
 
-Passive BLE advertising capture for reverse-engineering broadcast formats, plus optional GATT enumeration.  Scans are **non-blocking**: start a scan, wait, then fetch results.
+Active BLE advertising capture for reverse-engineering broadcast formats, plus optional GATT enumeration.  Scans are **non-blocking**: start a scan, wait, then fetch results.
 
 | Method | Params | Description |
 |---|---|---|
 | `ble/scan` | `durationMs?` | Start a scan (default 5000 ms); returns immediately |
 | `ble/scan/results` | — | Stop the scan (if running) and return captured devices |
 | `ble/scan/stop` | — | Stop a continuous scan early |
-| `ble/connect` | `mac`, `timeoutMs?` | GATT client connect to a peer MAC |
+| `ble/connect` | `mac`, `timeoutMs?` | Begin an **asynchronous** GATT connect to a peer MAC (default timeout 5000 ms) |
+| `ble/connect/results` | — | Poll the outcome of the last async connect |
 | `ble/disconnect` | — | Drop the GATT link |
 | `ble/services/start` | — | Enumerate services/characteristics (background task); returns immediately |
 | `ble/services/results` | `notifyCaptureMs?` | Wait for enumeration + notified values (default 3000 ms) |
-| `ble/services/stop` | — | Unsubscribe from notifications |
+| `ble/services/stop` | — | Unsubscribe from notifications and close the link |
 
 #### `ble/scan` / `ble/scan/results`
 
@@ -575,29 +576,37 @@ Passive BLE advertising capture for reverse-engineering broadcast formats, plus 
 ```
 
 Notes for reverse engineering:
-- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 8 entries (device count bounded to 32).  A change between entries is a state change in the broadcaster (e.g. a button press or level change).
-- `count` is the number of distinct payloads captured for that device.
+- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 8 retained entries (device count bounded to 32).  A change between entries is a state change in the broadcaster (e.g. a button press or level change).  When the bound is reached the oldest entry is dropped; `count` is the number of distinct payloads currently retained.
 - `manufacturer` contains the manufacturer-specific data as hex — company ID is the first two bytes (little-endian).  The example payload above uses manufacturer ID `0xFF00` and the 8-byte prefix `6D B6 43 CE 97 FE 42 7C` (a broadcast-controlled toy protocol), with `D5 96 4C` → `C1 BA 0B` showing a state change.
 - `isConnectable` is a heuristic from the BLE flags AD type; absent/malformed flags default to connectable.
 
-#### `ble/connect` / `ble/services/*`
+#### `ble/connect` / `ble/connect/results` / `ble/services/*`
 
 ```json
-{"jsonrpc":"2.0","method":"ble/connect","id":16,"params":{"mac":"00:1b:66:c6:da:c8"}}
+{"jsonrpc":"2.0","method":"ble/connect","id":16,"params":{"mac":"00:1b:66:c6:da:c8","timeoutMs":5000}}
 ```
 ```json
-{"jsonrpc":"2.0","id":16,"result":{"ok":true,"connected":true}}
+{"jsonrpc":"2.0","id":16,"result":{"started":true,"connecting":true,"connected":false}}
+```
+
+`ble/connect` returns immediately; the open handshake completes in the background within `timeoutMs` (the parameter is enforced).  Poll for the outcome:
+
+```json
+{"jsonrpc":"2.0","method":"ble/connect/results","id":17}
+```
+```json
+{"jsonrpc":"2.0","id":17,"result":{"connecting":false,"connected":true}}
 ```
 
 ```json
-{"jsonrpc":"2.0","method":"ble/services/start","id":17}
+{"jsonrpc":"2.0","method":"ble/services/start","id":18}
 ```
 ```json
-{"jsonrpc":"2.0","method":"ble/services/results","id":18}
+{"jsonrpc":"2.0","method":"ble/services/results","id":19}
 ```
 ```json
 {
-  "jsonrpc":"2.0","id":18,
+  "jsonrpc":"2.0","id":19,
   "result":{"connected":true,"services":[
     {"uuid":"00001800-0000-1000-8000-00805f9b34fb","characteristics":[
       {"uuid":"00002a00-0000-1000-8000-00805f9b34fb","properties":"read",
@@ -607,7 +616,7 @@ Notes for reverse engineering:
 }
 ```
 
-GATT enumeration runs on a background task so a slow or uncooperative peer cannot block the MCP server; `ble/services/results` bounds the wait (`notifyCaptureMs` + 10 s discovery cap).
+GATT enumeration runs in the background so a slow or uncooperative peer cannot block the MCP server.  Every operation is time-bounded: the open handshake (`timeoutMs`), service discovery (10 s cap), characteristic reads (5 s per read), and the notified-value capture window (`notifyCaptureMs`, default 3000 ms).  `ble/services/stop` (or `ble/disconnect`) closes the link, tearing down any in-flight work safely.
 
 ### TypeScript client example
 
