@@ -10,6 +10,11 @@
 #define BOARD_HAS_BLE       1
 #define BOARD_HAS_CAN       1   // TWAI via external transceiver
 
+// ── Memory ───────────────────────────────────────────────────────────────────
+// Cap the bus-history auto-config heap budget so Bluetooth has room for its
+// controller + workqueue + scan allocations.  See BusHistory::platformFreeHeap().
+#define BOARD_BUS_HISTORY_HEAP_CAP  (128 * 1024)
+
 // ── I2C ──────────────────────────────────────────────────────────────────────
 // SDA and SCL are clearly labelled on the board silkscreen.
 #define BOARD_I2C_SDA       23

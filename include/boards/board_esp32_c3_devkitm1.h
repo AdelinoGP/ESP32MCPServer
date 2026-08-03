@@ -11,6 +11,11 @@
 #define BOARD_HAS_BLE       1   // BLE 5.0 (no Classic BT)
 #define BOARD_HAS_CAN       1   // TWAI
 
+// ── Memory ───────────────────────────────────────────────────────────────────
+// Cap the bus-history auto-config heap budget so Bluetooth has room for its
+// controller + workqueue + scan allocations.  See BusHistory::platformFreeHeap().
+#define BOARD_BUS_HISTORY_HEAP_CAP  (128 * 1024)
+
 // ── I2C ──────────────────────────────────────────────────────────────────────
 // NOTE: GPIO8 carries the onboard WS2812B RGB LED on this board.
 // GPIO5/GPIO6 are chosen to avoid that conflict.
