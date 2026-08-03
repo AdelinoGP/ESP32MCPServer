@@ -159,20 +159,21 @@ void test_record_payload_empty_ignored(void) {
     TEST_ASSERT_EQUAL(0, hist.size());
 }
 
-void test_record_payload_bounds_at_four_and_evicts_oldest(void) {
+void test_record_payload_bounds_at_deep_cap_and_evicts_oldest(void) {
     std::vector<std::string> hist;
     uint32_t count = 0;
     std::map<std::string, bool> seen;
-    for (int i = 0; i < 12; ++i) {
+    // Exceed the deep cap (MAX_PAYLOADS=64) by a comfortable margin.
+    for (int i = 0; i < 100; ++i) {
         char hex[8];
         std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
         recordPayload(hist, count, seen, hex);
     }
     TEST_ASSERT_EQUAL_UINT32(MAX_PAYLOADS, count);
     TEST_ASSERT_EQUAL(MAX_PAYLOADS, hist.size());
-    // Oldest retained is "0809" (i=8); "0001" was evicted.
-    TEST_ASSERT_EQUAL_STRING("0809", hist[0].c_str());
-    TEST_ASSERT_EQUAL_STRING("0b0c", hist[MAX_PAYLOADS - 1].c_str());
+    // Oldest retained is "2425" (i=36); "0001" was evicted.
+    TEST_ASSERT_EQUAL_STRING("2425", hist[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("6364", hist[MAX_PAYLOADS - 1].c_str());
 }
 
 void test_record_payload_evicted_payload_can_reappear(void) {
@@ -189,6 +190,51 @@ void test_record_payload_evicted_payload_can_reappear(void) {
     recordPayload(hist, count, seen, "0001");
     TEST_ASSERT_EQUAL_UINT32(MAX_PAYLOADS, count);
     TEST_ASSERT_EQUAL_STRING("0001", hist[MAX_PAYLOADS - 1].c_str());
+}
+
+// The unfiltered ble/scan/results endpoint serialises only the newest
+// MAX_PAYLOADS_VIEW payloads (oldest -> newest among the serialised ones)
+// while count reports the true distinct total.  This helper returns that
+// slice so the serialisation rule is tested exactly as the firmware applies
+// it.
+static void viewSlice(const std::vector<std::string>& history,
+                      std::vector<std::string>& out) {
+    out.clear();
+    size_t start = history.size() > MAX_PAYLOADS_VIEW
+                       ? history.size() - MAX_PAYLOADS_VIEW
+                       : 0;
+    for (size_t i = start; i < history.size(); ++i) out.push_back(history[i]);
+}
+
+void test_view_slice_returns_newest_four_when_history_deep(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    for (int i = 0; i < 10; ++i) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
+        recordPayload(hist, count, seen, hex);
+    }
+    std::vector<std::string> view;
+    viewSlice(hist, view);
+    TEST_ASSERT_EQUAL(MAX_PAYLOADS_VIEW, view.size());
+    // count is the true total; the view is the newest slice.
+    TEST_ASSERT_EQUAL_UINT32(10, count);
+    TEST_ASSERT_EQUAL_STRING("0607", view[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("090a", view[MAX_PAYLOADS_VIEW - 1].c_str());
+}
+
+void test_view_slice_returns_whole_history_when_shallow(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    recordPayload(hist, count, seen, "0102");
+    recordPayload(hist, count, seen, "0103");
+    std::vector<std::string> view;
+    viewSlice(hist, view);
+    TEST_ASSERT_EQUAL(2, view.size());
+    TEST_ASSERT_EQUAL_STRING("0102", view[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("0103", view[1].c_str());
 }
 
 void test_record_payload_truncates_long_payloads(void) {
@@ -253,10 +299,12 @@ int runUnityTests(void) {
     RUN_TEST(test_record_payload_appends_distinct_payloads);
     RUN_TEST(test_record_payload_skips_duplicates);
     RUN_TEST(test_record_payload_empty_ignored);
-    RUN_TEST(test_record_payload_bounds_at_four_and_evicts_oldest);
+    RUN_TEST(test_record_payload_bounds_at_deep_cap_and_evicts_oldest);
     RUN_TEST(test_record_payload_evicted_payload_can_reappear);
     RUN_TEST(test_record_payload_truncates_long_payloads);
     RUN_TEST(test_record_payload_truncation_deduplicates_to_common_prefix);
+    RUN_TEST(test_view_slice_returns_newest_four_when_history_deep);
+    RUN_TEST(test_view_slice_returns_whole_history_when_shallow);
     return UNITY_END();
 }
 

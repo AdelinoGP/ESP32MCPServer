@@ -440,15 +440,45 @@ void setup() {
         });
 
     // ble/scan/results — stop scan (if running) and return captured reports.
+    // Optional "mac" param: case-insensitive filter that returns ONLY that
+    // device with its FULL payload history.  Without mac, every device is
+    // returned with only the newest MAX_PAYLOADS_VIEW payloads (count still
+    // reports the true distinct total) so the response stays small even
+    // under a flooded radio; the deep history is available via ?mac=.
     mcpServer.registerMethodHandler("ble/scan/results",
-        [](uint8_t, uint32_t id, const JsonObject&) -> std::string {
+        [](uint8_t, uint32_t id, const JsonObject& p) -> std::string {
             bleScanner.stopScan();
             auto reports = bleScanner.getResults();
+            std::string macFilter;
+            if (p["mac"].is<const char*>()) {
+                macFilter = p["mac"].as<const char*>();
+                for (char& c : macFilter) c = static_cast<char>(tolower(c));
+            }
             JsonDocument doc;
             doc["jsonrpc"] = "2.0";
             doc["id"] = id;
             JsonArray arr = doc["result"]["devices"].to<JsonArray>();
             for (const auto& r : reports) {
+                if (!macFilter.empty()) {
+                    std::string mac = r.mac;
+                    for (char& c : mac) c = static_cast<char>(tolower(c));
+                    if (mac != macFilter) continue;
+                    // Deep fetch: serialise the complete history.
+                    JsonObject o = arr.add<JsonObject>();
+                    o["mac"]          = r.mac;
+                    o["name"]         = r.name;
+                    o["rssi"]         = r.rssi;
+                    o["services"]     = r.servicesHex;
+                    o["manufacturer"] = r.manufacturer;
+                    o["connectable"]  = r.isConnectable;
+                    o["count"]        = r.count;
+                    if (r.firstSeen != 0) o["firstSeen"] = r.firstSeen;
+                    JsonArray hist = o["payloadHistory"].to<JsonArray>();
+                    for (const auto& pl : r.payloadHistory) {
+                        hist.add(pl);
+                    }
+                    break;  // at most one matching device
+                }
                 JsonObject o = arr.add<JsonObject>();
                 o["mac"]          = r.mac;
                 o["name"]         = r.name;
@@ -458,10 +488,14 @@ void setup() {
                 o["connectable"]  = r.isConnectable;
                 o["count"]        = r.count;
                 if (r.firstSeen != 0) o["firstSeen"] = r.firstSeen;
-                // Distinct payloads seen for this MAC, oldest -> newest.
+                // Quick-look view: only the newest MAX_PAYLOADS_VIEW payloads.
                 JsonArray hist = o["payloadHistory"].to<JsonArray>();
-                for (const auto& p : r.payloadHistory) {
-                    hist.add(p);
+                constexpr size_t view = mcp::blecore::MAX_PAYLOADS_VIEW;
+                size_t start = r.payloadHistory.size() > view
+                                   ? r.payloadHistory.size() - view
+                                   : 0;
+                for (size_t i = start; i < r.payloadHistory.size(); ++i) {
+                    hist.add(r.payloadHistory[i]);
                 }
             }
             std::string out; serializeJson(doc, out); return out;

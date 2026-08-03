@@ -540,7 +540,7 @@ Active BLE advertising capture for reverse-engineering broadcast formats, plus o
 | Method | Params | Description |
 |---|---|---|
 | `ble/scan` | `durationMs?` | Start a scan (default 5000 ms); returns immediately |
-| `ble/scan/results` | — | Stop the scan (if running) and return captured devices |
+| `ble/scan/results` | `mac?` | Stop the scan (if running) and return captured devices; optional case-insensitive `mac` returns only that device with its **full** payload history |
 | `ble/scan/stop` | — | Stop a continuous scan early |
 | `ble/connect` | `mac`, `timeoutMs?` | Begin an **asynchronous** GATT connect to a peer MAC (default timeout 5000 ms) |
 | `ble/connect/results` | — | Poll the outcome of the last async connect |
@@ -580,7 +580,8 @@ Active BLE advertising capture for reverse-engineering broadcast formats, plus o
 ```
 
 Notes for reverse engineering:
-- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 4 retained entries (device count bounded to 12, payloads capped at 64 bytes each) so the whole capture fits the device heap as one JSON response — even under a flooded BLE radio.  A change between entries is a state change in the broadcaster (e.g. a button press or level change).  When the bound is reached the oldest entry is dropped; `count` is the number of distinct payloads currently retained.  Re-scan to capture more history.
+- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 64 retained entries (device count bounded to 12, payloads capped at 64 bytes each).  A change between entries is a state change in the broadcaster (e.g. a button press or level change).  When the bound is reached the oldest entry is dropped; `count` is the number of distinct payloads currently retained.
+- The unfiltered `ble/scan/results` response serialises only the **newest 4** payloads per device (`count` still reports the true distinct total, so `payloadHistory` length may be less than `count`).  Pass the optional `mac` param (case-insensitive) to fetch a single device's **full** history — e.g. `ble/scan/results` with `{"mac":"62:38:e6:6b:1c:f9"}`.  This keeps the quick-look response small even when the BLE radio is flooded while preserving deep per-device capture for protocol reverse-engineering.
 - `manufacturer` contains the manufacturer-specific data as hex — company ID is the first two bytes (little-endian).  The example payload above uses manufacturer ID `0xFF00` and the 8-byte prefix `6D B6 43 CE 97 FE 42 7C` (a broadcast-controlled toy protocol), with `D5 96 4C` → `C1 BA 0B` showing a state change.
 - `isConnectable` is a heuristic from the BLE flags AD type; absent/malformed flags default to connectable.
 

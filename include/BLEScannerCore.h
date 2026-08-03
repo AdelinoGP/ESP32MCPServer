@@ -45,14 +45,24 @@ struct BLEServiceInfo {
 
 namespace blecore {
 
-// Bounds for the per-device payload history (tunable constants).  Kept
-// deliberately small: the whole capture is serialised by ble/scan/results in
-// one JSON response, and the ESP32-S3 heap is tight while a busy BLE radio
-// floods the scanner (12 devices x 4 payloads x 64 bytes keeps the response
-// well under ~12 KB).  For protocol reverse-engineering, 4 distinct payloads
-// per MAC per scan is enough to spot a state change; re-scan to capture more.
-constexpr size_t MAX_DEVICES  = 12;   // tracked MACs per scan
-constexpr size_t MAX_PAYLOADS = 4;    // distinct payloads per MAC
+// Bounds for the per-device payload history (tunable constants).
+//
+// MAX_PAYLOADS (the deep cap) is deliberately generous — it is what makes
+// protocol reverse-engineering possible in a single scan: 64 distinct
+// payloads covers a full command set (e.g. 10 levels x 2 channels + heater +
+// patterns) with margin.  The per-device storage cost is bounded by
+// MAX_PAYLOAD_HEX, so 64 x 128 chars x 12 devices is the pathological worst
+// case (~98 KB) and real captures (payloads are <= 62 bytes on air, ambient
+// devices rarely broadcast more than a couple of distinct payloads) land at
+// a few KB.
+//
+// The ble/scan/results endpoint serialises ONLY the newest MAX_PAYLOADS_VIEW
+// payloads per device (count reports the true distinct total), keeping the
+// unfiltered response the proven-safe size even under a flooded radio; the
+// full history is available per-MAC via ble/scan/results?mac=.
+constexpr size_t MAX_DEVICES       = 12;   // tracked MACs per scan
+constexpr size_t MAX_PAYLOADS      = 64;   // distinct payloads per MAC (deep)
+constexpr size_t MAX_PAYLOADS_VIEW = 4;    // payloads serialised by the unfiltered endpoint
 // Cap on the length of a single stored payload.  Payloads longer than this are
 // truncated to MAX_PAYLOAD_BYTES*2 hex chars so the scan history (and the
 // JSON serialised by ble/scan/results) stays small even when the radio is
