@@ -1,9 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
+
+#include "BLEScannerCore.h"
 
 #ifndef NATIVE_TEST
 #include <BLEAdvertisedDevice.h>
@@ -20,23 +22,6 @@ class BLERemoteCharacteristic;
 
 namespace mcp {
 
-// One captured BLE advertising report (raw broadcast payload).
-struct BLEAdvReport {
-    std::string mac;
-    std::string name;          // advertised name (may be empty)
-    int         rssi;          // dBm (latest)
-    // Distinct payloads seen for this MAC, oldest -> newest.  Each entry is the
-    // complete raw advertising payload as lowercase hex.  Payload changes are
-    // the key signal when reverse-engineering a broadcast format.
-    std::vector<std::string> payloadHistory;
-    std::string servicesHex;   // advertised 128/32/16-bit service UUIDs, comma-separated
-    std::string manufacturer;  // manufacturer data, hex (company id first 2 bytes)
-    bool        isConnectable;
-    uint64_t    firstSeen;     // millis() of first report
-    // Number of DISTINCT payloads captured for this MAC.
-    uint32_t    count;
-};
-
 // One GATT characteristic discovered on a connected device.
 struct BLECharInfo {
     std::string uuid;
@@ -52,7 +37,7 @@ struct BLEServiceInfo {
 };
 
 // ---------------------------------------------------------------------------
-// BLEScanner — passive BLE advertising capture + optional GATT enumeration.
+// BLEScanner — BLE advertising capture + optional GATT enumeration.
 //
 // Purpose: capture what nearby devices broadcast so the payload format of a
 // given app/device can be reverse engineered.  All captured data is exposed
@@ -134,10 +119,6 @@ public:
     static void onScanCompleteStatic(BLEScanResults results);
 
 private:
-    // Bounds for the per-device payload history (tunable constants).
-    static constexpr size_t MAX_DEVICES       = 32;   // tracked MACs per scan
-    static constexpr size_t MAX_PAYLOADS      = 8;    // distinct payloads per MAC
-
     bool scanning_ = false;
     bool connected_ = false;
     std::string connectedMac_;
@@ -155,7 +136,6 @@ private:
     SemaphoreHandle_t gattDoneSem_ = nullptr;
     volatile bool gattBusy_ = false;
     volatile bool gattCancelled_ = false;
-    void recordPayload(BLEAdvReport& rep, const std::string& payloadHex);
     void onNotify(class BLERemoteCharacteristic* chr, uint8_t* data, size_t len);
     void gattTaskBody();
     static void gattTaskStatic(void* param);

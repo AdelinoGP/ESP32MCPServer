@@ -1,5 +1,7 @@
 #include <unity.h>
 #include "BLEScannerCore.h"
+#include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -122,6 +124,74 @@ void test_connectable_zero_length_ad_terminates(void) {
 }
 
 // ---------------------------------------------------------------------------
+// recordPayload — per-device distinct-payload history
+// ---------------------------------------------------------------------------
+
+void test_record_payload_appends_distinct_payloads(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    recordPayload(hist, count, seen, "0102");
+    recordPayload(hist, count, seen, "0103");
+    TEST_ASSERT_EQUAL_UINT32(2, count);
+    TEST_ASSERT_EQUAL(2, hist.size());
+    TEST_ASSERT_EQUAL_STRING("0102", hist[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("0103", hist[1].c_str());
+}
+
+void test_record_payload_skips_duplicates(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    recordPayload(hist, count, seen, "0102");
+    recordPayload(hist, count, seen, "0102");
+    recordPayload(hist, count, seen, "0102");
+    TEST_ASSERT_EQUAL_UINT32(1, count);
+    TEST_ASSERT_EQUAL(1, hist.size());
+}
+
+void test_record_payload_empty_ignored(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    recordPayload(hist, count, seen, "");
+    TEST_ASSERT_EQUAL_UINT32(0, count);
+    TEST_ASSERT_EQUAL(0, hist.size());
+}
+
+void test_record_payload_bounds_at_eight_and_evicts_oldest(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    for (int i = 0; i < 12; ++i) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
+        recordPayload(hist, count, seen, hex);
+    }
+    TEST_ASSERT_EQUAL_UINT32(8, count);
+    TEST_ASSERT_EQUAL(8, hist.size());
+    // Oldest retained is "0405" (i=4); "0001" was evicted.
+    TEST_ASSERT_EQUAL_STRING("0405", hist[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("0b0c", hist[7].c_str());
+}
+
+void test_record_payload_evicted_payload_can_reappear(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    for (int i = 0; i < 9; ++i) {
+        char hex[8];
+        std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
+        recordPayload(hist, count, seen, hex);
+    }
+    // The very first payload was evicted from the history, so a re-broadcast
+    // of it is a distinct change again and must be recorded.
+    recordPayload(hist, count, seen, "0001");
+    TEST_ASSERT_EQUAL_UINT32(8, count);
+    TEST_ASSERT_EQUAL_STRING("0001", hist[7].c_str());
+}
+
+// ---------------------------------------------------------------------------
 
 int runUnityTests(void) {
     UNITY_BEGIN();
@@ -143,6 +213,11 @@ int runUnityTests(void) {
     RUN_TEST(test_connectable_truncated_ad_defaults_true);
     RUN_TEST(test_connectable_flags_after_service_ad);
     RUN_TEST(test_connectable_zero_length_ad_terminates);
+    RUN_TEST(test_record_payload_appends_distinct_payloads);
+    RUN_TEST(test_record_payload_skips_duplicates);
+    RUN_TEST(test_record_payload_empty_ignored);
+    RUN_TEST(test_record_payload_bounds_at_eight_and_evicts_oldest);
+    RUN_TEST(test_record_payload_evicted_payload_can_reappear);
     return UNITY_END();
 }
 

@@ -3,22 +3,25 @@
 #include "BLEScanner.h"
 #include "BLEScannerCore.h"
 #include <BLEAddress.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEUtils.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEClient.h>
-#include <BLERemoteService.h>
+#include <BLEDevice.h>
 #include <BLERemoteCharacteristic.h>
 #include <BLERemoteDescriptor.h>
+#include <BLERemoteService.h>
+#include <BLEScan.h>
 #include <BLEUUID.h>
+#include <BLEUtils.h>
 #include <ArduinoJson.h>
 
 namespace mcp {
 
+using blecore::MAX_DEVICES;
+using blecore::MAX_PAYLOADS;
 using blecore::hexEncode;
 using blecore::hexToAscii;
 using blecore::payloadIsConnectable;
+using blecore::recordPayload;
 
 // ---------------------------------------------------------------------------
 // Advertising callback — merges duplicate reports per MAC so the raw payload
@@ -58,11 +61,11 @@ bool BLEScanner::startScan(uint32_t durationMs) {
     seenPayloads_.clear();
     scanning_ = true;
     BLEScan* scan = BLEDevice::getScan();
-    // wantDuplicates=false: the library then keeps ONE result per device
-    // instead of accumulating every duplicate advertisement, which would
-    // exhaust the heap on a busy radio environment.  Payload deltas are
-    // captured via the per-device payload history instead.
-    scan->setAdvertisedDeviceCallbacks(new ScannerCallback(this), false);
+    // wantDuplicates=true: deliver every advertisement to the callback so the
+    // per-device payload history can capture payload changes.  The library
+    // frees each BLEAdvertisedDevice after onResult() returns, so the heap
+    // stays bounded even on a busy radio environment.
+    scan->setAdvertisedDeviceCallbacks(new ScannerCallback(this), true);
     // Active scan requests scan responses (more data, e.g. names).
     scan->setActiveScan(true);
     scan->setInterval(100);
@@ -99,19 +102,6 @@ void BLEScanner::clearResults() {
     seenPayloads_.clear();
 }
 
-void BLEScanner::recordPayload(BLEAdvReport& rep, const std::string& payloadHex) {
-    if (payloadHex.empty()) return;
-    auto& seen = seenPayloads_[rep.mac];
-    if (seen.count(payloadHex)) return;  // duplicate payload — skip
-    seen[payloadHex] = true;
-    rep.payloadHistory.push_back(payloadHex);
-    // Bound the per-device history; drop the oldest entry when full.
-    while (rep.payloadHistory.size() > MAX_PAYLOADS) {
-        rep.payloadHistory.erase(rep.payloadHistory.begin());
-    }
-    rep.count = static_cast<uint32_t>(rep.payloadHistory.size());
-}
-
 void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     if (adv == nullptr) return;
 
@@ -127,7 +117,7 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     for (auto& r : reports_) {
         if (r.mac == mac) {
             r.rssi = adv->getRSSI();
-            recordPayload(r, payloadHex);
+            recordPayload(r.payloadHistory, r.count, seenPayloads_[r.mac], payloadHex);
             return;
         }
     }
@@ -162,7 +152,8 @@ void BLEScanner::onAdv(BLEAdvertisedDevice* adv) {
     }
 
     reports_.push_back(rep);
-    recordPayload(reports_.back(), payloadHex);
+    recordPayload(reports_.back().payloadHistory, reports_.back().count,
+                  seenPayloads_[rep.mac], payloadHex);
 }
 
 // ---------------------------------------------------------------------------

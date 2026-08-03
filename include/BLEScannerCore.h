@@ -6,10 +6,34 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace mcp {
+
+// One captured BLE advertising report (raw broadcast payload).
+struct BLEAdvReport {
+    std::string mac;
+    std::string name;          // advertised name (may be empty)
+    int         rssi;          // dBm (latest)
+    // Distinct payloads seen for this MAC, oldest -> newest.  Each entry is the
+    // complete raw advertising payload as lowercase hex.  Payload changes are
+    // the key signal when reverse-engineering a broadcast format.
+    std::vector<std::string> payloadHistory;
+    std::string servicesHex;   // advertised 128/32/16-bit service UUIDs, comma-separated
+    std::string manufacturer;  // manufacturer data, hex (company id first 2 bytes)
+    bool        isConnectable;
+    uint64_t    firstSeen;     // millis() of first report
+    // Number of DISTINCT payloads captured for this MAC.
+    uint32_t    count;
+};
+
 namespace blecore {
+
+// Bounds for the per-device payload history (tunable constants).
+constexpr size_t MAX_DEVICES  = 32;   // tracked MACs per scan
+constexpr size_t MAX_PAYLOADS = 8;    // distinct payloads per MAC
 
 // Encode raw bytes as lowercase hex ("" for empty input).
 inline std::string hexEncode(const uint8_t* data, size_t len) {
@@ -68,6 +92,26 @@ inline bool payloadIsConnectable(const uint8_t* payload, size_t len) {
         i += adLen + 1;
     }
     return true;
+}
+
+// Record a raw payload into a report's per-device payload history.  Identical
+// payloads are skipped; distinct payloads are appended oldest -> newest,
+// bounded to MAX_PAYLOADS entries (oldest dropped when full), and the report's
+// count tracks the number of distinct payloads currently retained.  The seen
+// set stays consistent with the history so an evicted payload can be recorded
+// again if it re-broadcasts later.
+inline void recordPayload(std::vector<std::string>& history, uint32_t& count,
+                          std::map<std::string, bool>& seen,
+                          const std::string& payloadHex) {
+    if (payloadHex.empty()) return;
+    if (seen.count(payloadHex)) return;  // duplicate payload — skip
+    seen[payloadHex] = true;
+    history.push_back(payloadHex);
+    while (history.size() > MAX_PAYLOADS) {  // drop the oldest entry when full
+        seen.erase(history.front());
+        history.erase(history.begin());
+    }
+    count = static_cast<uint32_t>(history.size());
 }
 
 } // namespace blecore
