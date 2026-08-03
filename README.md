@@ -21,6 +21,7 @@ Connect an AI agent directly to your hardware: query I2C sensors, parse NMEA 018
 | **OBD-II / CAN** | Standard 11-bit OBD-II service 01/09 PID decoding (60+ PIDs) |
 | **Bus History** | Persistent ring buffers for CAN, NMEA, NMEA 2000, OBD-II — queryable via MCP |
 | **Bus Readers** | Time-bounded serial and CAN reads, raw or parsed mode, JSON output |
+| **Bluetooth (BLE)** | Passive advertising scanner (raw payload capture + history) and GATT enumeration — queryable via MCP |
 | **WiFi** | AP setup UI + STA mode; credentials stored in NVS |
 | **Discovery** | mDNS (`_mcp._tcp`) + UDP capability broadcast |
 | **Metrics** | Heap, uptime, RSSI, histogram stats with boot persistence |
@@ -527,6 +528,86 @@ After subscribing the server pushes unsolicited `notifications/resources/updated
 ```json
 {"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"sensor://i2c/bme280_0x76"}}
 ```
+
+### Bluetooth (BLE)
+
+Passive BLE advertising capture for reverse-engineering broadcast formats, plus optional GATT enumeration.  Scans are **non-blocking**: start a scan, wait, then fetch results.
+
+| Method | Params | Description |
+|---|---|---|
+| `ble/scan` | `durationMs?` | Start a scan (default 5000 ms); returns immediately |
+| `ble/scan/results` | — | Stop the scan (if running) and return captured devices |
+| `ble/scan/stop` | — | Stop a continuous scan early |
+| `ble/connect` | `mac`, `timeoutMs?` | GATT client connect to a peer MAC |
+| `ble/disconnect` | — | Drop the GATT link |
+| `ble/services/start` | — | Enumerate services/characteristics (background task); returns immediately |
+| `ble/services/results` | `notifyCaptureMs?` | Wait for enumeration + notified values (default 3000 ms) |
+| `ble/services/stop` | — | Unsubscribe from notifications |
+
+#### `ble/scan` / `ble/scan/results`
+
+```json
+{"jsonrpc":"2.0","method":"ble/scan","id":14,"params":{"durationMs":10000}}
+```
+```json
+{"jsonrpc":"2.0","id":14,"result":{"started":true,"scanning":true}}
+```
+
+```json
+{"jsonrpc":"2.0","method":"ble/scan/results","id":15}
+```
+```json
+{
+  "jsonrpc":"2.0","id":15,
+  "result":{"devices":[
+    {
+      "mac":"62:38:e6:6b:1c:f9","name":"","rssi":-56,"connectable":true,
+      "count":2,
+      "payloadHistory":[
+        "0201010effff006db643ce97fe427cd5964c03038fae",
+        "0201010effff006db643ce97fe427cc1ba0b03038fae"
+      ],
+      "services":"0000ae8f-0000-1000-8000-00805f9b34fb",
+      "manufacturer":"ff006db643ce97fe427cd5964c"
+    }
+  ]}
+}
+```
+
+Notes for reverse engineering:
+- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 8 entries (device count bounded to 32).  A change between entries is a state change in the broadcaster (e.g. a button press or level change).
+- `count` is the number of distinct payloads captured for that device.
+- `manufacturer` contains the manufacturer-specific data as hex — company ID is the first two bytes (little-endian).  The example payload above uses manufacturer ID `0xFF00` and the 8-byte prefix `6D B6 43 CE 97 FE 42 7C` (a broadcast-controlled toy protocol), with `D5 96 4C` → `C1 BA 0B` showing a state change.
+- `isConnectable` is a heuristic from the BLE flags AD type; absent/malformed flags default to connectable.
+
+#### `ble/connect` / `ble/services/*`
+
+```json
+{"jsonrpc":"2.0","method":"ble/connect","id":16,"params":{"mac":"00:1b:66:c6:da:c8"}}
+```
+```json
+{"jsonrpc":"2.0","id":16,"result":{"ok":true,"connected":true}}
+```
+
+```json
+{"jsonrpc":"2.0","method":"ble/services/start","id":17}
+```
+```json
+{"jsonrpc":"2.0","method":"ble/services/results","id":18}
+```
+```json
+{
+  "jsonrpc":"2.0","id":18,
+  "result":{"connected":true,"services":[
+    {"uuid":"00001800-0000-1000-8000-00805f9b34fb","characteristics":[
+      {"uuid":"00002a00-0000-1000-8000-00805f9b34fb","properties":"read",
+       "valueHex":"4c452d4844203335304254","valueText":"LE-HD 350BT"}
+    ]}
+  ]}
+}
+```
+
+GATT enumeration runs on a background task so a slow or uncooperative peer cannot block the MCP server; `ble/services/results` bounds the wait (`notifyCaptureMs` + 10 s discovery cap).
 
 ### TypeScript client example
 
