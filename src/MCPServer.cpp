@@ -1,6 +1,7 @@
 #include "MCPServer.h"
 #include "MCPTypes.h"
 #include <ArduinoJson.h>
+#include <new>
 
 using namespace mcp;
 
@@ -140,7 +141,19 @@ std::string MCPServer::dispatch(uint8_t clientId, const std::string& method,
     // Check extension method handlers registered by external components
     auto it = methodHandlers_.find(method);
     if (it != methodHandlers_.end()) {
-        return it->second(clientId, id, params);
+        try {
+            return it->second(clientId, id, params);
+        } catch (const std::bad_alloc&) {
+            // Heap exhaustion (e.g. a huge ble/scan/results payload).  NEVER
+            // let the exception escape: on the device it propagates out of
+            // the MCP task through the WebSockets library and std::terminate
+            // reboots the board, dropping every connected client.  Reply with
+            // a JSON-RPC error instead; the client sees a clean failure and
+            // the server keeps serving.
+            return makeError(id, -32603, "Internal error: out of memory");
+        } catch (...) {
+            return makeError(id, -32603, "Internal error");
+        }
     }
 
     return makeError(id, -32601, "Method not found");

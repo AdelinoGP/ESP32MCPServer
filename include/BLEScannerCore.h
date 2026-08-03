@@ -45,9 +45,20 @@ struct BLEServiceInfo {
 
 namespace blecore {
 
-// Bounds for the per-device payload history (tunable constants).
-constexpr size_t MAX_DEVICES  = 32;   // tracked MACs per scan
-constexpr size_t MAX_PAYLOADS = 8;    // distinct payloads per MAC
+// Bounds for the per-device payload history (tunable constants).  Kept
+// deliberately small: the whole capture is serialised by ble/scan/results in
+// one JSON response, and the ESP32-S3 heap is tight while a busy BLE radio
+// floods the scanner (12 devices x 4 payloads x 64 bytes keeps the response
+// well under ~12 KB).  For protocol reverse-engineering, 4 distinct payloads
+// per MAC per scan is enough to spot a state change; re-scan to capture more.
+constexpr size_t MAX_DEVICES  = 12;   // tracked MACs per scan
+constexpr size_t MAX_PAYLOADS = 4;    // distinct payloads per MAC
+// Cap on the length of a single stored payload.  Payloads longer than this are
+// truncated to MAX_PAYLOAD_BYTES*2 hex chars so the scan history (and the
+// JSON serialised by ble/scan/results) stays small even when the radio is
+// flooded by chatty broadcasters.
+constexpr size_t MAX_PAYLOAD_BYTES = 64;
+constexpr size_t MAX_PAYLOAD_HEX   = MAX_PAYLOAD_BYTES * 2;
 
 // Encode raw bytes as lowercase hex ("" for empty input).
 inline std::string hexEncode(const uint8_t* data, size_t len) {
@@ -112,15 +123,22 @@ inline bool payloadIsConnectable(const uint8_t* payload, size_t len) {
 // payloads are skipped; distinct payloads are appended oldest -> newest,
 // bounded to MAX_PAYLOADS entries (oldest dropped when full), and the report's
 // count tracks the number of distinct payloads currently retained.  The seen
-// set stays consistent with the history so an evicted payload can be recorded
-// again if it re-broadcasts later.
+// set stays consistent with the history (keyed by the stored form) so an
+// evicted payload can be recorded again if it re-broadcasts later.  Payloads
+// longer than MAX_PAYLOAD_HEX are truncated before they are stored — and
+// deduplicated after truncation — so a chatty broadcaster cannot bloat the
+// history or the serialised results.
 inline void recordPayload(std::vector<std::string>& history, uint32_t& count,
                           std::map<std::string, bool>& seen,
                           const std::string& payloadHex) {
     if (payloadHex.empty()) return;
-    if (seen.count(payloadHex)) return;  // duplicate payload — skip
-    seen[payloadHex] = true;
-    history.push_back(payloadHex);
+    std::string stored = payloadHex;
+    if (stored.length() > MAX_PAYLOAD_HEX) {
+        stored.resize(MAX_PAYLOAD_HEX);
+    }
+    if (seen.count(stored)) return;  // duplicate (after truncation) — skip
+    seen[stored] = true;
+    history.push_back(stored);
     while (history.size() > MAX_PAYLOADS) {  // drop the oldest entry when full
         seen.erase(history.front());
         history.erase(history.begin());

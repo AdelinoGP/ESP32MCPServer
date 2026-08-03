@@ -580,7 +580,7 @@ Active BLE advertising capture for reverse-engineering broadcast formats, plus o
 ```
 
 Notes for reverse engineering:
-- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 8 retained entries (device count bounded to 32).  A change between entries is a state change in the broadcaster (e.g. a button press or level change).  When the bound is reached the oldest entry is dropped; `count` is the number of distinct payloads currently retained.
+- `payloadHistory` holds the **distinct raw payloads** (oldest → newest) seen per device, bounded to 4 retained entries (device count bounded to 12, payloads capped at 64 bytes each) so the whole capture fits the device heap as one JSON response — even under a flooded BLE radio.  A change between entries is a state change in the broadcaster (e.g. a button press or level change).  When the bound is reached the oldest entry is dropped; `count` is the number of distinct payloads currently retained.  Re-scan to capture more history.
 - `manufacturer` contains the manufacturer-specific data as hex — company ID is the first two bytes (little-endian).  The example payload above uses manufacturer ID `0xFF00` and the 8-byte prefix `6D B6 43 CE 97 FE 42 7C` (a broadcast-controlled toy protocol), with `D5 96 4C` → `C1 BA 0B` showing a state change.
 - `isConnectable` is a heuristic from the BLE flags AD type; absent/malformed flags default to connectable.
 

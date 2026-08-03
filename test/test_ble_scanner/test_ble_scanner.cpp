@@ -159,7 +159,7 @@ void test_record_payload_empty_ignored(void) {
     TEST_ASSERT_EQUAL(0, hist.size());
 }
 
-void test_record_payload_bounds_at_eight_and_evicts_oldest(void) {
+void test_record_payload_bounds_at_four_and_evicts_oldest(void) {
     std::vector<std::string> hist;
     uint32_t count = 0;
     std::map<std::string, bool> seen;
@@ -168,18 +168,18 @@ void test_record_payload_bounds_at_eight_and_evicts_oldest(void) {
         std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
         recordPayload(hist, count, seen, hex);
     }
-    TEST_ASSERT_EQUAL_UINT32(8, count);
-    TEST_ASSERT_EQUAL(8, hist.size());
-    // Oldest retained is "0405" (i=4); "0001" was evicted.
-    TEST_ASSERT_EQUAL_STRING("0405", hist[0].c_str());
-    TEST_ASSERT_EQUAL_STRING("0b0c", hist[7].c_str());
+    TEST_ASSERT_EQUAL_UINT32(MAX_PAYLOADS, count);
+    TEST_ASSERT_EQUAL(MAX_PAYLOADS, hist.size());
+    // Oldest retained is "0809" (i=8); "0001" was evicted.
+    TEST_ASSERT_EQUAL_STRING("0809", hist[0].c_str());
+    TEST_ASSERT_EQUAL_STRING("0b0c", hist[MAX_PAYLOADS - 1].c_str());
 }
 
 void test_record_payload_evicted_payload_can_reappear(void) {
     std::vector<std::string> hist;
     uint32_t count = 0;
     std::map<std::string, bool> seen;
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i <= MAX_PAYLOADS; ++i) {
         char hex[8];
         std::snprintf(hex, sizeof(hex), "%02x%02x", i, i + 1);
         recordPayload(hist, count, seen, hex);
@@ -187,8 +187,45 @@ void test_record_payload_evicted_payload_can_reappear(void) {
     // The very first payload was evicted from the history, so a re-broadcast
     // of it is a distinct change again and must be recorded.
     recordPayload(hist, count, seen, "0001");
-    TEST_ASSERT_EQUAL_UINT32(8, count);
-    TEST_ASSERT_EQUAL_STRING("0001", hist[7].c_str());
+    TEST_ASSERT_EQUAL_UINT32(MAX_PAYLOADS, count);
+    TEST_ASSERT_EQUAL_STRING("0001", hist[MAX_PAYLOADS - 1].c_str());
+}
+
+void test_record_payload_truncates_long_payloads(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    // 100 bytes -> 200 hex chars, longer than MAX_PAYLOAD_HEX (128).
+    std::string longPayload;
+    for (int i = 0; i < 100; ++i) {
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02x", i & 0xFF);
+        longPayload += hex;
+    }
+    recordPayload(hist, count, seen, longPayload);
+    TEST_ASSERT_EQUAL_UINT32(1, count);
+    TEST_ASSERT_EQUAL(MAX_PAYLOAD_HEX, hist[0].length());
+    // Truncated content equals the first 128 chars of the original.
+    TEST_ASSERT_EQUAL_STRING(longPayload.substr(0, MAX_PAYLOAD_HEX).c_str(), hist[0].c_str());
+}
+
+void test_record_payload_truncation_deduplicates_to_common_prefix(void) {
+    std::vector<std::string> hist;
+    uint32_t count = 0;
+    std::map<std::string, bool> seen;
+    // Two distinct long payloads that share their first 128 chars.
+    std::string a, b;
+    for (int i = 0; i < 100; ++i) {
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02x", i & 0xFF);
+        a += hex;
+    }
+    b = a.substr(0, MAX_PAYLOAD_HEX) + "deadbeef";
+    recordPayload(hist, count, seen, a);
+    recordPayload(hist, count, seen, b);
+    // Both truncate to the identical stored string -> recorded once.
+    TEST_ASSERT_EQUAL_UINT32(1, count);
+    TEST_ASSERT_EQUAL(1, hist.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +253,10 @@ int runUnityTests(void) {
     RUN_TEST(test_record_payload_appends_distinct_payloads);
     RUN_TEST(test_record_payload_skips_duplicates);
     RUN_TEST(test_record_payload_empty_ignored);
-    RUN_TEST(test_record_payload_bounds_at_eight_and_evicts_oldest);
+    RUN_TEST(test_record_payload_bounds_at_four_and_evicts_oldest);
     RUN_TEST(test_record_payload_evicted_payload_can_reappear);
+    RUN_TEST(test_record_payload_truncates_long_payloads);
+    RUN_TEST(test_record_payload_truncation_deduplicates_to_common_prefix);
     return UNITY_END();
 }
 
